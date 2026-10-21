@@ -9,7 +9,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-MODULES = ["test_imem", "test_outbox", "test_drafter"]
+MODULES = ["test_imem", "test_outbox", "test_drafter", "test_notifier"]
 
 
 def load(name: str):

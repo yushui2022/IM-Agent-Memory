@@ -292,7 +292,61 @@ drafter.run_once(store, my_composer)
 python tools/draft_demo.py
 ```
 
-## 11. 尚未实现（按优先级）
+## 11. 草稿推送（接到手机）
+
+> **本仓库不做手机端。** 手机端就是飞书 / Telegram / 邮件的 App 本身——
+> 我们只给机器人发一条消息，推送走它们自家的通道。
+
+| 通道 | 手机端 | 需要什么 |
+|---|---|---|
+| **飞书群机器人 webhook** | 飞书 App | 建群 → 群设置 → 群机器人 → 添加 → 复制 URL。**最简单** |
+| Telegram Bot | Telegram App | @BotFather 拿 token |
+| SMTP | 系统邮件 | 邮箱账号 |
+
+### 零回调的确认闭环
+
+```bash
+export IMEM_FEISHU_WEBHOOK='https://open.feishu.cn/open-apis/bot/v2/hook/xxx'
+
+python tools/push_drafts.py --db imem.db              # dry-run，只打印
+python tools/push_drafts.py --db imem.db --send       # 推到你手机
+python tools/push_drafts.py --db imem.db --approve 1 3  # 确认第 1、3 条
+python tools/push_drafts.py --db imem.db --cancel 2     # 作废第 2 条
+```
+
+手机上收到的是这样一条消息：
+
+```
+📝 待审草稿 3 条
+
+#1 [张三]
+   收到：评审改到几点了？
+   拟回：收到，我确认一下再回你。
+#2 [李四]
+   收到：合同你签了吗
+   拟回：收到，我确认一下再回你。
+```
+
+**每条都必须带「收到什么」**——只知道"我打算回什么"、不知道在回什么，人是没法做判断的。
+
+编号按 `outbox.id` 升序固定，避免每次顺序不同导致点错条目。
+
+### 确认 ≠ 发送
+
+`--approve` 只把状态从 `draft` 改成 `approved`。真正的发送仍要在 UI 上执行并回读验证
+（见 §9）。**这个脚本永远不会替你发消息**——有测试守着这条红线。
+
+### 确认方式的三档演进
+
+| 档 | 你要做什么 | 需要什么 | 状态 |
+|---|---|---|---|
+| **L0 单向推送 + 本机确认** | 手机上看到清单，回机器上执行 `--approve` | 一个 webhook URL | ✅ 已实现 |
+| L1 回复关键词 | 在飞书回 `ok 2`，机器人收到后 approve | 飞书长连接（不需要公网 IP） | ⬜ |
+| L2 卡片按钮 | 点消息里的「发送」「作废」 | 自建应用 + 卡片回调 | ⬜ |
+
+先做 L0 的原因：它零回调基础设施就能形成真闭环，而且能立刻暴露"草稿质量够不够"这个真问题。
+
+## 12. 尚未实现（按优先级）
 
 1. `search()` 与 `vector_search()` 的结果融合（RRF）——现在两者独立
 2. 跨 app 同一实体的**候选建议**（`unresolved()` 已给出素材）
@@ -300,7 +354,7 @@ python tools/draft_demo.py
 4. 保留策略与遗忘（按会话 / 按人删除原始消息）
 5. 增量导出给 LLM 做摘要的批处理封装
 
-## 12. 目录
+## 13. 目录
 
 ```
 IM-Agent-Memory/
@@ -311,17 +365,20 @@ IM-Agent-Memory/
 │   ├── text.py           归一化 / CJK 分词 / 时间解析 / 去重锚
 │   ├── db.py             连接、初始化、幂等迁移
 │   ├── store.py          唯一对外 API（读写 + 出站闸门）
-│   └── drafter.py        起草层：候选筛选 / 策略 / composer 插槽
+│   ├── drafter.py        起草层：候选筛选 / 策略 / composer 插槽
+│   └── notifier.py       草稿推送：飞书 webhook / Telegram / SMTP
 ├── tools/
 │   ├── mock_demo.py      端到端演示：读 → 检索 → 起草 → 闸门 → 发送 → 回读
-│   └── draft_demo.py     草稿模式演示：起草后停在 draft，绝不发送
+│   ├── draft_demo.py     草稿模式演示：起草后停在 draft，绝不发送
+│   └── push_drafts.py    推送待审草稿到手机 + 本机确认/作废
 └── tests/
     ├── run_all.py        统一入口
     ├── test_imem.py      21 个：存储与检索
     ├── test_outbox.py    14 个：出站闸门、归因、静默失败
-    └── test_drafter.py   14 个：起草策略、幂等、绝不发送
+    ├── test_drafter.py   14 个：起草策略、幂等、绝不发送
+    └── test_notifier.py  12 个：渲染、通道、失败隔离、CLI
 ```
 
-## 13. 许可证
+## 14. 许可证
 
 [MIT](LICENSE) © 2026 yushui2022
