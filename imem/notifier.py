@@ -114,6 +114,64 @@ class Notifier:
             return {"channel": "smtp", "ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def render_escalations(rows: list[dict], titles: dict[str, str] | None = None,
+                       incoming: dict[int, str] | None = None,
+                       max_items: int = 8) -> str:
+    """升级通知：agent 拿不准，需要人拍板。**这才是唯一该惊动你的消息。**"""
+    if not rows:
+        return ""
+    titles = titles or {}
+    incoming = incoming or {}
+    shown = rows[:max_items]
+    lines = [f"🚨 需要你介入 {len(rows)} 条", ""]
+    for i, r in enumerate(shown, 1):
+        conv = titles.get(r["conversation_key"], r["conversation_key"])
+        lines.append(f"#{i} [{conv}] {r.get('escalate_reason') or '需要人工判断'}")
+        src = incoming.get(r.get("source_message_id") or -1, "")
+        if src:
+            src = src.replace("\n", " ")
+            lines.append("   收到：" + (src[:60] + "…" if len(src) > 60 else src))
+    if len(rows) > len(shown):
+        lines.append(f"… 还有 {len(rows) - len(shown)} 条")
+    return "\n".join(lines)
+
+
+def render_actions(rows: list[dict], titles: dict[str, str] | None = None,
+                   incoming: dict[int, str] | None = None,
+                   max_items: int = 10) -> str:
+    """事后通报：已经替你处理了。**只告知，不需要你做什么。**"""
+    if not rows:
+        return ""
+    titles = titles or {}
+    incoming = incoming or {}
+    shown = rows[:max_items]
+    lines = [f"✅ 刚替你回了 {len(rows)} 条", ""]
+    for r in shown:
+        conv = titles.get(r["conversation_key"], r["conversation_key"])
+        src = incoming.get(r.get("source_message_id") or -1, "")
+        src = src.replace("\n", " ")
+        if len(src) > 40:
+            src = src[:40] + "…"
+        body = (r.get("text") or "").replace("\n", " ")
+        if len(body) > 40:
+            body = body[:40] + "…"
+        lines.append(f"· [{conv}] {src} → {body}" if src else f"· [{conv}] {body}")
+    if len(rows) > len(shown):
+        lines.append(f"… 还有 {len(rows) - len(shown)} 条")
+    return "\n".join(lines)
+
+
+def render_digest(escalations: list[dict], actions: list[dict],
+                  titles: dict[str, str] | None = None,
+                  incoming: dict[int, str] | None = None) -> str:
+    """一条消息同时给出「需要你介入」和「已替你处理」。都为空则返回空串。"""
+    parts = [p for p in (render_escalations(escalations, titles, incoming),
+                         render_actions(actions, titles, incoming)) if p]
+    if not parts:
+        return ""
+    return "\n\n──────────\n\n".join(parts)
+
+
 def push(notifier: Notifier, text: str, feishu_url: str = "", tg_token: str = "",
          tg_chat: str = "", smtp_cfg: dict | None = None) -> list[dict]:
     """按配置往所有可用通道发一遍。单个通道失败不影响其他。"""

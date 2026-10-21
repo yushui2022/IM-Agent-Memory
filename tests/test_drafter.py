@@ -1,7 +1,10 @@
-"""起草层测试。
+"""决策层测试。
 
-核心断言只有一句：**起草永远不发送。**
-其余是策略正确性：该回的回、该跳的跳、同一条只起草一次。
+核心断言：
+  - **默认自治**：普通消息直接处理掉，人不需要在场
+  - **该沉默就沉默**：确认语、纯附件不回
+  - **该找人时才找人**：涉及钱/合同/投诉 → 升级，且不自作主张
+  - **红线不变**：整个过程不产生任何发送动作
 
 运行： python tests/test_drafter.py
 """
@@ -17,8 +20,8 @@ from imem import Store, text as T
 from imem import drafter
 
 
-def now_ts(offset_s: int = 0) -> str:
-    return (datetime.now(T.TZ) - timedelta(seconds=offset_s)).isoformat(timespec="seconds")
+def ago(s: int) -> str:
+    return (datetime.now(T.TZ) - timedelta(seconds=s)).isoformat(timespec="seconds")
 
 
 def setup():
@@ -29,167 +32,191 @@ def setup():
     return s, dm, grp
 
 
-def test_incoming_dm_gets_drafted():
+def ask(s, conv, text, sender="张三", ts=5):
+    s.ingest(conv, [{"sender": sender, "text": text, "ts": ago(ts)}])
+    return s.recent(conv, n=1)[0]["id"]
+
+
+# ------------------------------------------------------------------ 默认自治
+def test_autonomous_reply_by_default():
     s, dm, _ = setup()
-    s.ingest(dm, [{"sender": "张三", "text": "明天的会议改到几点了？", "ts": now_ts(5)}])
+    ask(s, dm, "评审改到几点了？")
     r = drafter.run_once(s)
-    assert r["candidates"] == 1, r
-    assert len(r["drafted"]) == 1, r
-    d = r["drafted"][0]
-    assert d["state"] == "draft", d
-    assert d["risk"] == "normal", d
-    assert d["draft"], d
+
+    assert len(r["replied"]) == 1, r
+    d = r["replied"][0]
+    assert d["state"] == "approved", d          # 自动放行，不等人
+    ob = s.outbox_get(d["outbox_id"])
+    assert ob["state"] == "approved" and ob["auto_approved"] == 1, ob
+    assert r["escalated"] == [] and r["silent"] == [], r
 
 
-def test_draft_is_never_sent():
-    """整套设计的红线：起草不产生任何发送动作。"""
+def test_autonomous_does_not_send():
+    """红线：自动放行 ≠ 发送。"""
     s, dm, _ = setup()
-    s.ingest(dm, [{"sender": "张三", "text": "在吗", "ts": now_ts(5)}])
+    ask(s, dm, "评审改到几点了？")
     drafter.run_once(s)
 
     states = [x["state"] for x in s.conn.execute("SELECT state FROM outbox").fetchall()]
-    assert states == ["draft"], states
-    # 没有 sent / 没有消息被标成 agent 发的
-    assert s.stats()["messages"] == 1
-    assert s.recent(dm, n=10)[0]["sent_by"] == "other"
+    assert "sent" not in states and "verified" not in states, states
+    assert s.conn.execute(
+        "SELECT COUNT(*) FROM message WHERE sent_by='agent'").fetchone()[0] == 0
+    # 进入了执行器队列，等着被真正发出
+    assert len(s.outbox_ready_to_send()) == 1
 
 
-def test_group_skipped_by_default():
-    s, dm, grp = setup()
-    s.ingest(grp, [{"sender": "李四", "text": "这个方案谁看过了？", "ts": now_ts(5)}])
-    r = drafter.run_once(s)
-    assert r["candidates"] == 0, r
-
-
-def test_group_drafted_but_gate_blocks_when_policy_allows():
-    s, dm, grp = setup()
-    s.ingest(grp, [{"sender": "李四", "text": "这个方案谁看过了？", "ts": now_ts(5)}])
-    r = drafter.run_once(s, policy=drafter.Policy(skip_groups=False))
-    assert len(r["drafted"]) == 1, r
-    d = r["drafted"][0]
-    assert d["risk"] == "blocked", d
-    assert "群聊" in d["blocked_reason"], d
-    # 被拦的不会留在 pending 里
-    assert s.outbox_pending() == []
-
-
-def test_own_messages_never_drafted():
+def test_manual_mode_still_available():
+    """想要人工审的时候，把 auto_approve 关掉即可回到草稿模式。"""
     s, dm, _ = setup()
-    s.ingest(dm, [
-        {"sender": "我", "text": "我先说一句", "ts": now_ts(10)},
-        {"sender": "张三", "text": "收到", "ts": now_ts(8)},
-        {"sender": "张三", "text": "对了那个文件在哪？", "ts": now_ts(5)},
-    ])
+    ask(s, dm, "评审改到几点了？")
+    r = drafter.run_once(s, policy=drafter.Policy(auto_approve=False))
+    assert r["replied"][0]["state"] == "draft", r
+    assert s.outbox_ready_to_send() == []
+
+
+# ------------------------------------------------------------------ 沉默
+def test_ack_only_stays_silent():
+    s, dm, _ = setup()
+    for i, t in enumerate(["收到", "好的", "嗯", "谢谢", "👌"]):
+        ask(s, dm, t, ts=100 - i * 5)
     r = drafter.run_once(s, policy=drafter.Policy(min_gap_s=0))
-    # 只有张三的两条是候选，"我"那条不算
-    assert r["candidates"] == 2, r
-    assert all(x["sender"] == "张三" for x in r["drafted"]), r["drafted"]
+    assert r["replied"] == [], r
+    assert len(r["silent"]) == 5, r
+    assert all("不需要回应" in x["reason"] for x in r["silent"]), r["silent"]
 
 
+def test_attachment_only_stays_silent():
+    s, dm, _ = setup()
+    ask(s, dm, "[图片]")
+    ask(s, dm, "[语音]", ts=3)
+    r = drafter.run_once(s, policy=drafter.Policy(min_gap_s=0))
+    assert r["replied"] == [], r
+
+
+def test_composer_returning_none_stays_silent():
+    s, dm, _ = setup()
+    ask(s, dm, "这个要怎么弄？")
+    r = drafter.run_once(s, composer=lambda ctx: None)
+    assert r["replied"] == [], r
+    assert "不值得回" in r["silent"][0]["reason"], r
+
+
+def test_allowlist_restricts_autonomy():
+    s, dm, _ = setup()
+    dm2 = s.ensure_conversation("wechat", "李四", kind="dm", app_chat_key="dm_ls")
+    ask(s, dm, "几点开会？")
+    ask(s, dm2, "几点开会？")
+
+    # 空白名单 = 全部禁用
+    r = drafter.run_once(s, policy=drafter.Policy(scope_allowlist=[]))
+    assert r["replied"] == [], r
+    assert len(r["silent"]) == 2, r
+
+    # 只放开其中一个
+    r2 = drafter.run_once(s, policy=drafter.Policy(scope_allowlist=[dm]))
+    assert len(r2["replied"]) == 1, r2
+    assert r2["replied"][0]["conversation_key"] == dm, r2
+
+
+def test_group_never_autonomous():
+    s, dm, grp = setup()
+    ask(s, grp, "这个方案谁看过？", sender="王五")
+    r = drafter.run_once(s)
+    assert r["candidates"] == 0 and r["replied"] == [], r
+
+
+# ------------------------------------------------------------------ 升级
+def test_escalates_on_money_or_contract():
+    s, dm, _ = setup()
+    ask(s, dm, "合同你签了吗")
+    r = drafter.run_once(s)
+
+    assert r["replied"] == [], r                 # 没有自作主张
+    assert len(r["escalated"]) == 1, r
+    e = r["escalated"][0]
+    assert "合同" in e["reason"], e
+    ob = s.outbox_get(e["outbox_id"])
+    assert ob["state"] == "escalated" and ob["text"] == "", ob
+    assert s.outbox_for_message(e["message_id"]) is not None
+
+
+def test_escalation_not_reprocessed():
+    s, dm, _ = setup()
+    ask(s, dm, "投诉这个怎么处理")
+    r1 = drafter.run_once(s)
+    assert len(r1["escalated"]) == 1, r1
+    r2 = drafter.run_once(s)
+    assert r2["candidates"] == 0, r2
+
+
+def test_escalation_can_be_resolved_by_human():
+    s, dm, _ = setup()
+    ask(s, dm, "这个报价要不要发")
+    e = drafter.run_once(s)["escalated"][0]
+    assert len(s.outbox_escalated()) == 1
+    assert s.resolve_escalation(e["outbox_id"]) == 1
+    assert s.outbox_escalated() == []
+
+
+def test_daily_fuse_escalates():
+    """单会话一天自动回太多 → 熔断交给人工，而不是继续刷。"""
+    s, dm, _ = setup()
+    ask(s, dm, "第一件事几点？", ts=60)
+    ask(s, dm, "第二件事几点？", ts=50)
+    pol = drafter.Policy(min_gap_s=0, max_auto_per_day=1)
+    r = drafter.run_once(s, policy=pol)
+
+    assert len(r["replied"]) == 1, r
+    assert len(r["escalated"]) == 1, r
+    assert "上限" in r["escalated"][0]["reason"], r
+
+
+# ------------------------------------------------------------------ 其他
 def test_answered_message_skipped():
     s, dm, _ = setup()
-    s.ingest(dm, [{"sender": "张三", "text": "明天开会吗", "ts": now_ts(60)}])
-    s.ingest(dm, [{"sender": "我", "text": "开，九点", "ts": now_ts(30)}])
+    ask(s, dm, "明天开会吗", ts=60)
+    s.ingest(dm, [{"sender": "我", "text": "开", "ts": ago(30)}])
     r = drafter.run_once(s)
     assert r["candidates"] == 0, r
 
 
-def test_idempotent_one_draft_per_message():
+def test_idempotent_one_pass_per_message():
     s, dm, _ = setup()
-    s.ingest(dm, [{"sender": "张三", "text": "在吗", "ts": now_ts(5)}])
+    ask(s, dm, "文件在哪？")
     r1 = drafter.run_once(s)
-    assert len(r1["drafted"]) == 1
+    assert len(r1["replied"]) == 1, r1
     r2 = drafter.run_once(s)
-    assert r2["candidates"] == 0, r2       # 第二轮不再重复起草
+    assert r2["candidates"] == 0, r2
     assert s.conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 1
-
-    # 第二道防线：绕过 find_candidates 直接再起一次，闸门也会拦
-    mid = s.recent(dm, n=1)[0]["id"]
-    msg = dict(s.conn.execute("SELECT * FROM message WHERE id=?", (mid,)).fetchone())
-    again = drafter.draft_for(s, msg)
-    assert again["risk"] == "blocked", again
-    assert "已起草过" in again["blocked_reason"], again
-
-
-def test_stale_message_skipped():
-    s, dm, _ = setup()
-    s.ingest(dm, [{"sender": "张三", "text": "这条是两小时前的", "ts": now_ts(7200)}])
-    r = drafter.run_once(s, policy=drafter.Policy(max_age_s=3600))
-    assert r["candidates"] == 0, r
-
-
-def test_composer_returning_none_skips():
-    s, dm, _ = setup()
-    s.ingest(dm, [{"sender": "张三", "text": "嗯", "ts": now_ts(5)}])
-    r = drafter.run_once(s, composer=lambda ctx: None)
-    assert r["candidates"] == 1
-    assert r["drafted"] == [], r
-    assert "不值得回" in r["skipped"][0]["reason"], r
-
-
-def test_source_message_linked():
-    s, dm, _ = setup()
-    s.ingest(dm, [{"sender": "张三", "text": "文件发我一下", "ts": now_ts(5)}])
-    mid = s.recent(dm, n=1)[0]["id"]
-    drafter.run_once(s)
-    ob = s.outbox_for_message(mid)
-    assert ob is not None and ob["source_message_id"] == mid, ob
-    assert ob["state"] == "draft"
 
 
 def test_min_gap_prevents_flood():
     s, dm, _ = setup()
-    s.ingest(dm, [
-        {"sender": "张三", "text": "第一条", "ts": now_ts(20)},
-        {"sender": "张三", "text": "第二条", "ts": now_ts(15)},
-        {"sender": "张三", "text": "第三条", "ts": now_ts(10)},
-    ])
+    ask(s, dm, "第一件事几点？", ts=20)
+    ask(s, dm, "第二件事几点？", ts=15)
+    ask(s, dm, "第三件事几点？", ts=10)
     r = drafter.run_once(s, policy=drafter.Policy(min_gap_s=300))
-    assert len(r["drafted"]) == 1, r
-    assert len(r["skipped"]) == 2, r
-    assert all("不足 300s" in x["reason"] for x in r["skipped"]), r["skipped"]
+    assert len(r["replied"]) == 1, r
+    assert len(r["silent"]) == 2, r
 
 
-def test_max_drafts_per_run_capped():
-    s, dm, grp = setup()
-    dm2 = s.ensure_conversation("wechat", "李四", kind="dm", app_chat_key="dm_ls")
-    dm3 = s.ensure_conversation("wechat", "王五", kind="dm", app_chat_key="dm_ww")
-    for conv in (dm, dm2, dm3):
-        s.ingest(conv, [{"sender": "某人", "text": "问你个事", "ts": now_ts(5)}])
-    r = drafter.run_once(s, policy=drafter.Policy(min_gap_s=0, max_drafts_per_run=2))
-    assert len(r["drafted"]) == 2, r
-    assert any("单轮上限" in x["reason"] for x in r["skipped"]), r["skipped"]
-
-
-def test_composer_receives_context():
+def test_own_messages_never_processed():
     s, dm, _ = setup()
-    # 第二条包含第一条的子串，所以子串检索能召回（这就是当前的真实能力边界）
-    s.ingest(dm, [
-        {"sender": "张三", "text": "周四的评审改到几点了", "ts": now_ts(120)},
-        {"sender": "张三", "text": "评审改到几点了，我这边好安排", "ts": now_ts(5)},
-    ])
-    seen = []
-
-    def composer(ctx):
-        seen.append(ctx)
-        return "收到，我看下日程回你。"
-
-    drafter.run_once(s, composer=composer, policy=drafter.Policy(min_gap_s=0))
-    by_text = {c["message"]["text"]: c for c in seen}
-    assert by_text, seen
-
-    ctx = by_text["评审改到几点了，我这边好安排"]
-    assert ctx["conversation"]["title"] == "张三", ctx["conversation"]
-    assert len(ctx["recent"]) >= 2, ctx["recent"]
-    related_texts = [r["text"] for r in ctx["related"]]
-    assert any("周四的评审改到几点了" in t for t in related_texts), related_texts
-
-
-def test_blank_message_not_drafted():
-    s, dm, _ = setup()
-    s.ingest(dm, [{"sender": "张三", "text": "…", "ts": now_ts(5)}])
+    s.ingest(dm, [{"sender": "我", "text": "我先说一句", "ts": ago(10)}])
+    ask(s, dm, "你刚说什么？", ts=5)
     r = drafter.run_once(s)
-    assert r["drafted"] == [], r       # 太短，composer 返回 None
+    assert len(r["replied"]) == 1, r
+    assert r["replied"][0]["incoming"] == "你刚说什么？", r
+
+
+def test_should_reply_logic():
+    assert drafter.should_reply("评审改到几点了？") is True
+    assert drafter.should_reply("帮我发一下文件") is True
+    assert drafter.should_reply("收到") is False
+    assert drafter.should_reply("好的") is False
+    assert drafter.should_reply("嗯") is False
+    assert drafter.should_reply("[图片]") is False
+    assert drafter.should_reply("今天天气不错") is False    # 默认沉默
 
 
 # ------------------------------------------------------------------ 运行器

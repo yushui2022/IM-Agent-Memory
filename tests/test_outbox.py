@@ -183,6 +183,97 @@ def test_schema_version_recorded():
     assert dbmod.schema_version(s.conn) == dbmod.SCHEMA_VERSION
 
 
+def test_auto_approve_goes_straight_to_approved():
+    s, dm, _ = setup()
+    r = s.enqueue_draft(dm, "策略自动放行", auto_approve=True)
+    assert r["state"] == "approved", r
+    ob = s.outbox_get(r["id"])
+    assert ob["state"] == "approved" and ob["auto_approved"] == 1 and ob["approved_at"], ob
+    # 进了执行器队列，但依然没发送
+    assert [x["id"] for x in s.outbox_ready_to_send()] == [r["id"]]
+    assert s.stats()["messages"] == 0
+
+
+def test_blocked_never_enters_ready_queue():
+    s, dm, grp = setup()
+    r = s.enqueue_draft(grp, "群里不该发", auto_approve=True)
+    assert r["risk"] == "blocked" and r["state"] == "cancelled", r
+    assert s.outbox_ready_to_send() == []
+
+
+def test_escalate_state_and_resolve():
+    s, dm, _ = setup()
+    s.ingest(dm, [{"sender": "张三", "text": "合同你签了吗"}])
+    mid = s.recent(dm, n=1)[0]["id"]
+
+    e = s.escalate(dm, "涉及「合同」", source_message_id=mid)
+    assert e["state"] == "escalated"
+    rows = s.outbox_escalated()
+    assert len(rows) == 1 and rows[0]["escalate_reason"] == "涉及「合同」", rows
+    assert rows[0]["auto_approved"] == 0
+    # 升级项不在待发队列里
+    assert s.outbox_ready_to_send() == []
+
+    assert s.resolve_escalation(e["id"]) == 1
+    assert s.outbox_escalated() == []
+
+
+def test_recent_auto_for_digest():
+    s, dm, _ = setup()
+    s.enqueue_draft(dm, "自动回的", auto_approve=True)
+    s.enqueue_draft(dm, "没放行的", auto_approve=False)
+    rows = s.outbox_recent_auto(hours=24)
+    assert len(rows) == 1 and rows[0]["text"] == "自动回的", rows
+
+
+def test_migration_rebuilds_old_outbox():
+    """老库的 CHECK 不允许 'escalated'，迁移要重建表且不丢数据。"""
+    import sqlite3
+    from imem import db as dbmod
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE conversation(key TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE message(id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)")
+    conn.execute("""
+        CREATE TABLE outbox (
+            id INTEGER PRIMARY KEY,
+            conversation_key TEXT NOT NULL,
+            text TEXT NOT NULL,
+            text_norm TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'draft'
+                 CHECK (state IN ('draft','approved','sent','verified','failed','cancelled')),
+            risk TEXT NOT NULL DEFAULT 'normal',
+            block_reason TEXT,
+            created_at TEXT NOT NULL,
+            approved_at TEXT, sent_at TEXT, verified_at TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            message_id INTEGER,
+            source_message_id INTEGER,
+            note TEXT
+        )""")
+    conn.execute("INSERT INTO conversation(key) VALUES('wechat:x')")
+    conn.execute(
+        "INSERT INTO outbox(conversation_key, text, text_norm, state, created_at,"
+        " source_message_id, attempts) VALUES ('wechat:x','老数据','老数据','draft','2026-01-01',5,2)")
+
+    dbmod._migrate(conn)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(outbox)")}
+    assert {"escalate_reason", "auto_approved", "source_message_id"} <= cols, cols
+    row = conn.execute("SELECT * FROM outbox WHERE id=1").fetchone()
+    assert row["text"] == "老数据" and row["source_message_id"] == 5, dict(row)
+    assert row["attempts"] == 2, dict(row)
+    assert row["auto_approved"] == 0
+    # 现在能插 escalated 了
+    conn.execute("INSERT INTO outbox(conversation_key, text, text_norm, state, created_at)"
+                 " VALUES ('wechat:x','','','escalated','2026-01-02')")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outbox WHERE state='escalated'").fetchone()[0] == 1
+    assert dbmod.schema_version(conn) == dbmod.SCHEMA_VERSION
+
+
 # ------------------------------------------------------------------ 运行器
 def main() -> int:
     tests = [(k, v) for k, v in sorted(globals().items())

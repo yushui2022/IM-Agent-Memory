@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""把待审草稿推到你手机上，并在本机完成确认。
+"""把 agent 的动向推到你手机上：需要你介入的 + 已替你处理的。
 
-手机端不是我们做的：飞书 / Telegram / 邮件的 App 就是手机端，
-我们只给机器人发一条消息，推送走它们自家的通道。
+默认自治，所以这条消息的常态是「已替你回了 N 条」（看过就行），
+只有 agent 拿不准时才出现「🚨 需要你介入」。
+
+手机端不是我们做的：飞书 / Telegram / 邮件的 App 就是手机端。
 
 用法：
     # 只看（默认，不联网）
@@ -12,14 +14,14 @@
     export IMEM_FEISHU_WEBHOOK='https://open.feishu.cn/open-apis/bot/v2/hook/xxxx'
     python tools/push_drafts.py --db imem.db --send
 
-    # 确认第 1、3 条（只是置为 approved，**不发送**）
-    python tools/push_drafts.py --db imem.db --approve 1 3
+    # 处理升级项（人拍板后关掉）
+    python tools/push_drafts.py --db imem.db --resolve 1
 
-    # 作废第 2 条
+    # 手动起草留下的 draft 项仍可放行/作废
+    python tools/push_drafts.py --db imem.db --approve 1 3
     python tools/push_drafts.py --db imem.db --cancel 2
 
-红线：approve 只把状态从 draft 改成 approved。真正的发送要另外在 UI 上执行，
-      并用 ingest() 回读验证。这个脚本永远不会替你发消息。
+红线：approve 只改状态，**本脚本永远不会替你发消息**。
 """
 from __future__ import annotations
 
@@ -52,73 +54,82 @@ def smtp_cfg_from_env() -> dict | None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="推送并确认待审草稿")
-    ap.add_argument("--db", default="imem.db", help="SQLite 路径")
+    ap = argparse.ArgumentParser(description="推送 agent 动向并处理升级项")
+    ap.add_argument("--db", default="imem.db")
     ap.add_argument("--send", action="store_true", help="真的发出去（默认只打印）")
-    ap.add_argument("--approve", type=int, nargs="+", metavar="N", help="确认第 N 条")
-    ap.add_argument("--cancel", type=int, nargs="+", metavar="N", help="作废第 N 条")
-    ap.add_argument("--limit", type=int, default=8, help="消息里最多列几条")
+    ap.add_argument("--hours", type=int, default=24, help="「已替你处理」回溯多少小时")
+    ap.add_argument("--resolve", type=int, nargs="+", metavar="N", help="关掉第 N 条升级项")
+    ap.add_argument("--approve", type=int, nargs="+", metavar="N", help="放行第 N 条手写草稿")
+    ap.add_argument("--cancel", type=int, nargs="+", metavar="N", help="作废第 N 条手写草稿")
     args = ap.parse_args()
 
     s = Store(args.db)
-    pending = s.outbox_pending()
 
-    if not pending:
-        print("📭 没有待审草稿。")
-        return 0
+    # 编号固定按 id 升序，避免每次顺序不同导致点错条目
+    escalations = sorted(s.outbox_escalated(), key=lambda r: r["id"])
+    drafts = sorted(s.outbox_pending(), key=lambda r: r["id"])
+    drafts = [d for d in drafts if d["state"] == "draft"]
+    actions = sorted(s.outbox_recent_auto(args.hours), key=lambda r: r["id"])
 
-    # 编号固定按 id 升序，避免每次跑顺序不同导致确认错条目
-    pending.sort(key=lambda r: r["id"])
-    titles = {}
-    incoming = {}
-    for r in pending:
-        if r["conversation_key"] not in titles:
-            row = s.conn.execute("SELECT title FROM conversation WHERE key=?",
-                                 (r["conversation_key"],)).fetchone()
-            titles[r["conversation_key"]] = row["title"] if row else r["conversation_key"]
+    titles: dict[str, str] = {}
+    incoming: dict[int, str] = {}
+    for r in escalations + drafts + actions:
+        key = r["conversation_key"]
+        if key not in titles:
+            row = s.conn.execute("SELECT title FROM conversation WHERE key=?", (key,)).fetchone()
+            titles[key] = row["title"] if row else key
         src_id = r.get("source_message_id")
         if src_id and src_id not in incoming:
             row = s.conn.execute("SELECT text FROM message WHERE id=?", (src_id,)).fetchone()
             if row:
                 incoming[src_id] = row["text"]
 
-    # ---------------- 确认 / 作废
-    if args.approve or args.cancel:
+    # ---------------- 人工处理
+    if args.resolve or args.approve or args.cancel:
+        for n in (args.resolve or []):
+            if not 1 <= n <= len(escalations):
+                print(f"  ✗ 升级项 #{n} 不存在（共 {len(escalations)} 条）")
+                continue
+            ob = escalations[n - 1]
+            ok = s.resolve_escalation(ob["id"])
+            print(f"  ✓ 升级项 #{n} 已关闭（outbox#{ob['id']}）" if ok else f"  ✗ #{n} 状态不符")
         for n in (args.approve or []):
-            if not 1 <= n <= len(pending):
-                print(f"  ✗ #{n} 不存在（共 {len(pending)} 条）")
+            if not 1 <= n <= len(drafts):
+                print(f"  ✗ 草稿 #{n} 不存在（共 {len(drafts)} 条）")
                 continue
-            ob = pending[n - 1]
+            ob = drafts[n - 1]
             ok = s.approve(ob["id"])
-            print(f"  ✓ #{n} → approved（outbox#{ob['id']}）" if ok
-                  else f"  ✗ #{n} 状态不是 draft，未处理")
+            print(f"  ✓ 草稿 #{n} → approved（outbox#{ob['id']}）" if ok else f"  ✗ #{n} 不能放行")
         for n in (args.cancel or []):
-            if not 1 <= n <= len(pending):
-                print(f"  ✗ #{n} 不存在（共 {len(pending)} 条）")
+            if not 1 <= n <= len(drafts):
+                print(f"  ✗ 草稿 #{n} 不存在（共 {len(drafts)} 条）")
                 continue
-            ob = pending[n - 1]
+            ob = drafts[n - 1]
             ok = s.cancel(ob["id"])
-            print(f"  ✓ #{n} → cancelled（outbox#{ob['id']}）" if ok
-                  else f"  ✗ #{n} 状态不允许作废")
-        print("\n提醒：approved 只是允许发送，**并没有发出去**。")
-        print("     发送要在 UI 上执行，然后回读验证（message.sent_by 会变成 agent）。")
+            print(f"  ✓ 草稿 #{n} → cancelled（outbox#{ob['id']}）" if ok else f"  ✗ #{n} 不能作废")
+        print("\n提醒：approved 只是放行，**没有发出去**。发送由执行器在 UI 上做，再回读验证。")
         return 0
 
     # ---------------- 渲染 + 推送
-    text = notifier.render_drafts(pending, titles, max_items=args.limit,
-                                  incoming=incoming,
-                                  approve_hint="本机执行： python tools/push_drafts.py "
-                                               "--approve N   （N 见编号）")
+    if drafts:
+        text = notifier.render_drafts(drafts, titles, incoming=incoming,
+                                      approve_hint="放行： python tools/push_drafts.py "
+                                                   "--approve N")
+    else:
+        text = notifier.render_digest(escalations, actions, titles, incoming)
+
+    if not text:
+        print("📭 没有需要你介入的事，最近也没有自动处理的记录。")
+        return 0
+
     print(text)
     print()
-
     if not args.send:
         print("（dry-run：没有发送。加 --send 才会真的推到你手机）")
         return 0
 
-    n = notifier.Notifier()
     results = notifier.push(
-        n, text,
+        notifier.Notifier(), text,
         feishu_url=env("IMEM_FEISHU_WEBHOOK"),
         tg_token=env("IMEM_TG_TOKEN"),
         tg_chat=env("IMEM_TG_CHAT"),

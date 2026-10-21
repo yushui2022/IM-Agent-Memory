@@ -320,7 +320,14 @@ class Store:
                       allow_group: bool = False, max_len: int = 500,
                       rate_limit: int = 3, rate_window_s: int = 60,
                       dup_window_s: int = 600,
-                      source_message_id: int | None = None) -> dict:
+                      source_message_id: int | None = None,
+                      auto_approve: bool = False) -> dict:
+        """把待发消息放进队列。返回 {id, state, risk, reason}。
+
+        `auto_approve=True` 时直接置为 approved 并打上 auto_approved=1，
+        表示"由策略自动放行、没有人类参与"——便于事后审计。
+        **即便如此也不会发送**：发送必须由调用方在 UI 上执行并回读验证。
+        """
         """把待发消息放进队列。返回 {id, state, risk, reason}。
 
         闸门命中时 state='cancelled' + risk='blocked'，并写入 block_reason 留痕。
@@ -357,15 +364,18 @@ class Store:
                     reason = f"重复内容（已有 outbox#{dup['id']}），疑似循环"
 
         now = T.now_iso()
+        final_state = "cancelled" if reason else ("approved" if auto_approve else "draft")
         with self._tx():
             cur = self.conn.execute(
                 "INSERT INTO outbox(conversation_key, text, text_norm, state, risk,"
-                " block_reason, created_at, source_message_id) VALUES (?,?,?,?,?,?,?,?)",
-                (conversation_key, body, T.normalize(body),
-                 "cancelled" if reason else "draft",
-                 "blocked" if reason else "normal", reason, now, source_message_id))
+                " block_reason, created_at, source_message_id, approved_at, auto_approved)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (conversation_key, body, T.normalize(body), final_state,
+                 "blocked" if reason else "normal", reason, now, source_message_id,
+                 now if final_state == "approved" else None,
+                 1 if final_state == "approved" else 0))
             oid = int(cur.lastrowid)
-        return {"id": oid, "state": "cancelled" if reason else "draft",
+        return {"id": oid, "state": final_state,
                 "risk": "blocked" if reason else "normal", "reason": reason}
 
     def preflight(self, conversation_key: str, seen_title: str) -> dict:
@@ -378,11 +388,71 @@ class Store:
         return {"ok": ok, "expected": conv["title"], "seen": seen_title,
                 "reason": None if ok else "前台窗口标题与目标会话不一致，疑似切错窗口"}
 
-    def approve(self, outbox_id: int) -> int:
+    def approve(self, outbox_id: int, auto: bool = False) -> int:
         with self._tx():
             cur = self.conn.execute(
-                "UPDATE outbox SET state='approved', approved_at=? WHERE id=? AND state='draft'",
-                (T.now_iso(), outbox_id))
+                "UPDATE outbox SET state='approved', approved_at=?,"
+                " auto_approved=? WHERE id=? AND state='draft'",
+                (T.now_iso(), 1 if auto else 0, outbox_id))
+            return cur.rowcount or 0
+
+    def escalate(self, conversation_key: str, reason: str,
+                 source_message_id: int | None = None, note: str = "") -> dict:
+        """agent 判断"这事我拿不准"，转人工。
+
+        这是自治模式下**唯一**该惊动人的情况——不是每条都要批，而是
+        "我不该替你做这个决定时才叫你"。
+        """
+        conv = self.conn.execute(
+            "SELECT key FROM conversation WHERE key=?", (conversation_key,)).fetchone()
+        if not conv:
+            raise KeyError(f"未知会话: {conversation_key}")
+        now = T.now_iso()
+        with self._tx():
+            cur = self.conn.execute(
+                "INSERT INTO outbox(conversation_key, text, text_norm, state, risk,"
+                " escalate_reason, created_at, source_message_id, note)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (conversation_key, "", "", "escalated", "normal",
+                 reason, now, source_message_id, note))
+            oid = int(cur.lastrowid)
+        return {"id": oid, "state": "escalated", "reason": reason}
+
+    def outbox_ready_to_send(self, conversation_key: str | None = None) -> list[dict]:
+        """等执行器取走的队列：已放行、还没发。
+
+        执行器（agent 的 UI 操作层）应该只从这里取活，取完调 mark_sent()，
+        发完回读 ingest() 自动置 verified。
+        """
+        sql = "SELECT * FROM outbox WHERE state='approved'"
+        args: list = []
+        if conversation_key:
+            sql += " AND conversation_key=?"; args.append(conversation_key)
+        sql += " ORDER BY id"
+        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+
+    def outbox_recent_auto(self, hours: int = 24, limit: int = 50) -> list[dict]:
+        """最近自动放行/已发出的项——用于「刚替你回了什么」的事后通报。"""
+        rows = self.conn.execute(
+            "SELECT * FROM outbox WHERE auto_approved=1"
+            " AND state IN ('approved','sent','verified') AND created_at >= ?"
+            " ORDER BY id DESC LIMIT ?",
+            (self._iso_ago(hours * 3600), limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def outbox_escalated(self, limit: int = 50) -> list[dict]:
+        """需要人介入的项。"""
+        rows = self.conn.execute(
+            "SELECT * FROM outbox WHERE state='escalated' ORDER BY id DESC LIMIT ?",
+            (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_escalation(self, outbox_id: int, note: str = "") -> int:
+        """人处理完升级项后关掉它。"""
+        with self._tx():
+            cur = self.conn.execute(
+                "UPDATE outbox SET state='cancelled', note=? WHERE id=? AND state='escalated'",
+                (note or "由人工处理", outbox_id))
             return cur.rowcount or 0
 
     def mark_sent(self, outbox_id: int) -> int:

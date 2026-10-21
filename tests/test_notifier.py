@@ -42,7 +42,7 @@ def make_pending(n: int = 2):
                                      app_chat_key=f"dm_{i}")
         s.ingest(conv, [{"sender": name[i % 3], "text": f"第{i}个问题，你看下",
                          "ts": (datetime.now(T.TZ) - timedelta(seconds=10)).isoformat(timespec="seconds")}])
-    drafter.run_once(s, policy=drafter.Policy(min_gap_s=0))
+    drafter.run_once(s, policy=drafter.Policy(min_gap_s=0, auto_approve=False))
     return s, s.outbox_pending()
 
 
@@ -75,6 +75,30 @@ def test_render_truncates_long_text():
     assert "长" * 200 not in txt
 
 
+def test_render_escalations():
+    rows = [{"id": 1, "conversation_key": "c", "escalate_reason": "涉及「合同」，应由本人判断",
+             "source_message_id": 7}]
+    txt = notifier.render_escalations(rows, {"c": "李四"}, {7: "合同你签了吗"})
+    assert "需要你介入 1 条" in txt, txt
+    assert "涉及「合同」" in txt, txt
+    assert "合同你签了吗" in txt, txt
+
+
+def test_render_actions():
+    rows = [{"id": 1, "conversation_key": "c", "text": "收到，我确认一下再回你。",
+             "source_message_id": 7}]
+    txt = notifier.render_actions(rows, {"c": "张三"}, {7: "评审改到几点了？"})
+    assert "刚替你回了 1 条" in txt, txt
+    assert "评审改到几点了？" in txt and "收到" in txt, txt
+
+
+def test_render_digest_both_sections():
+    esc = [{"id": 1, "conversation_key": "c1", "escalate_reason": "涉及「金额」",
+            "source_message_id": 1}]
+    act = [{"id": 2, "conversation_key": "c2", "text": "收到。", "source_message_id": 2}]
+    txt = notifier.render_digest(esc, act, {"c1": "李四", "c2": "张三"}, {1: "多少钱", 2: "在吗？"})
+    assert "需要你介入" in txt and "刚替你回了" in txt, txt
+    assert notifier.render_digest([], []) == ""
 def test_render_overflow_notice():
     rows = [{"id": i, "conversation_key": "c", "text": f"t{i}"} for i in range(1, 6)]
     txt = notifier.render_drafts(rows, max_items=2)
@@ -172,7 +196,7 @@ def test_cli_dry_run_and_approve():
     conv = s.ensure_conversation("wechat", "张三", kind="dm", app_chat_key="dm_zs")
     s.ingest(conv, [{"sender": "张三", "text": "明天开会吗？",
                      "ts": (datetime.now(T.TZ) - timedelta(seconds=5)).isoformat(timespec="seconds")}])
-    drafter.run_once(s)
+    drafter.run_once(s, policy=drafter.Policy(auto_approve=False))
     s.close()
 
     script = os.path.join(ROOT, "tools", "push_drafts.py")

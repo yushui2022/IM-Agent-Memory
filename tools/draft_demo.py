@@ -58,31 +58,39 @@ def main() -> int:
     print(f"  私聊 张三 ×1，私聊 李四 ×1，群聊 产品群 ×1")
 
     # ---------------------------------------------------------------- 2 起草
-    line("2. 起草一轮（默认策略：跳过群聊、跳过已回复、1 小时内）")
-    r1 = drafter.run_once(s)
+    line("2. 人工审稿模式起草（Policy(auto_approve=False)）")
+    pol = drafter.Policy(auto_approve=False, min_gap_s=0)
+    r1 = drafter.run_once(s, policy=pol)
     print(f"  {drafter.summarize(r1)}")
-    for d in r1["drafted"]:
+    for d in r1["replied"]:
         print(f"\n  → 给「{d['sender']}」的草稿（outbox#{d['outbox_id']}）")
         print(f"    收到：{d['incoming']}")
-        print(f"    拟回：{d['draft']}")
-        print(f"    状态：{d['state']}  风险：{d['risk']}")
+        print(f"    拟回：{d['text']}")
+        print(f"    状态：{d['state']}  （停在 draft，等人放行）")
+    for d in r1["escalated"]:
+        print(f"\n  🚨 升级「{d['sender']}」：{d['reason']}")
 
     # ---------------------------------------------------------------- 3 群聊
-    line("3. 群聊为什么没被起草")
-    print(f"  默认 Policy(skip_groups=True)：群消息不进候选（群发本来就被闸门拦）")
-    r_group = drafter.run_once(s, policy=drafter.Policy(skip_groups=False, min_gap_s=0))
-    for d in r_group["drafted"]:
-        print(f"  群聊「{d['sender']}」尝试起草 → {d['risk']}：{d['blocked_reason']}")
+    line("3. 群聊为什么不会被处理")
+    print("  默认 Policy(skip_groups=True)：群消息根本不进候选（群发是公开事故）")
+    r_group = drafter.run_once(s, policy=drafter.Policy(skip_groups=False, min_gap_s=0,
+                                                       auto_approve=False))
+    for d in r_group["replied"]:
+        print(f"  群聊「{d['sender']}」仍被闸门拦下：outbox#{d['outbox_id']}")
+    for d in r_group["blocked"]:
+        print(f"  群聊「{d['sender']}」→ 被拦：{d['reason']}")
 
     # ---------------------------------------------------------------- 4 幂等
-    line("4. 再跑一轮 —— 同一条消息不会再起草")
-    r2 = drafter.run_once(s)
+    line("4. 再跑一轮 —— 同一条消息不会再处理")
+    r2 = drafter.run_once(s, policy=pol)
     print(f"  {drafter.summarize(r2)}")
     print(f"  outbox 总数：{s.conn.execute('SELECT COUNT(*) FROM outbox').fetchone()[0]}")
 
     # ---------------------------------------------------------------- 5 待审队列
-    line("5. 待审队列（这就是要推给你手机的内容）")
+    line("5. 待审队列（人工审稿模式下才存在）")
     for ob in s.outbox_pending():
+        if ob["state"] != "draft":
+            continue
         conv = s.conn.execute("SELECT title FROM conversation WHERE key=?",
                               (ob["conversation_key"],)).fetchone()["title"]
         print(f"  outbox#{ob['id']}  [{conv}]  state={ob['state']}")

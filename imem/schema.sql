@@ -70,11 +70,15 @@ CREATE TABLE IF NOT EXISTS outbox (
     text_norm        TEXT    NOT NULL,
     state            TEXT    NOT NULL DEFAULT 'draft'
                              CHECK (state IN ('draft','approved','sent',
-                                              'verified','failed','cancelled')),
+                                              'verified','failed','cancelled','escalated')),
     -- 闸门判定结果，留痕便于事后追责
     risk             TEXT    NOT NULL DEFAULT 'normal'
                              CHECK (risk IN ('normal','blocked')),
     block_reason     TEXT,
+    -- agent 判断"这事我拿不准"时的理由（state='escalated' 时有值）
+    escalate_reason  TEXT,
+    -- 1 = 由策略自动通过，没有人类参与（便于事后审计）
+    auto_approved    INTEGER NOT NULL DEFAULT 0,
     created_at       TEXT    NOT NULL,
     approved_at      TEXT,
     sent_at          TEXT,

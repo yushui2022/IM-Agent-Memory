@@ -183,8 +183,13 @@ s.vector_search("会议怎么定的", scope=conv)
 
 ```
 draft ──approve()──► approved ──mark_sent()──► sent ──回读验证──► verified
-  │                    │                        │
-  └──cancel()──► cancelled ◄──cancel()          └──fail()──► failed
+  │  ╲                 │                        │
+  │   ╲auto_approve    └──cancel()──► cancelled └──fail()──► failed
+  │    ╲（策略自动放行，人不在场）
+  └──cancel()──► cancelled
+
+escalate() ──► escalated ──resolve_escalation()──► cancelled
+              （不生成回复，等人工）
 ```
 
 **关键点：`sent` 不等于"发出去了"。** computer use 按下发送键后，你无法从任何返回值知道结果——
@@ -238,33 +243,51 @@ s.set_self_label("wechat", "我的昵称")
 
 不登记的话所有消息都是 `unknown`，且回读验证无法工作。
 
-## 10. 起草层（草稿模式）
+## 10. 决策层（默认自治）
 
-`imem/drafter.py`：读到新消息 → 判断该不该回 → 起草 → `enqueue_draft()`。
-**状态停在 `draft`，全程不发送。**
+`imem/drafter.py`：读到新消息 → 判断 → **自动回 / 沉默 / 升级给人**。
 
-### 默认策略（`Policy`，偏保守）
+目标不是"帮人起草"，是**代替人处理**。所以默认路径是直接处理掉，
+人只在真正该由人拍板的时候被惊动。
+
+### 三条出口
+
+| 出口 | 什么时候 | 结果 |
+|---|---|---|
+| **reply** | 该回、也回得来 | 起草 + 按策略自动放行（`state='approved'`、`auto_approved=1`），交给执行器 |
+| **silent** | 确认语、纯附件、不关我事、不在白名单 | 什么都不做。**这是大多数消息的正确答案** |
+| **escalate** | 涉及钱/合同/投诉、日内频次超限 | 不生成回复，转人工（`state='escalated'`） |
+
+### 默认策略（`Policy`）
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `max_age_s` | 3600 | 超过 1 小时的消息不再起草 |
-| `min_gap_s` | 30 | 同一会话两条草稿的最小间隔（`<=0` 表示不限） |
-| `skip_groups` | True | 群聊不起草（群发本来就被闸门拦） |
-| `only_unanswered` | True | 已经被本人/agent 回过的消息跳过 |
-| `max_drafts_per_run` | 5 | 单轮上限 |
+| `auto_approve` | **True** | 起草后自动放行，不需要人批 |
+| `scope_allowlist` | `None` | `None`=私聊全放开 / `[]`=全禁用 / `[conv…]`=仅这些会话自治 |
+| `skip_groups` | True | 群聊永久排除（群发是公开事故） |
+| `max_auto_per_day` | 20 | 单会话每日自动回复上限，超了转人工（熔断） |
+| `escalate_hints` | 合同/金额/投诉/律师… | 命中即升级，不做主张 |
+| `only_unanswered` | True | 已被本人/agent 回过的跳过 |
+| `max_age_s` / `min_gap_s` / `max_per_run` | 3600 / 30 / 5 | 时效、防刷、单轮上限 |
 
-### 为什么单独一层
+### 沉默比回复更重要
 
-- 选哪些消息值得回、什么时候回，是**策略**问题，不该散落在 agent 主循环里
-- 起草质量可以**单独评估**——你只看草稿，不承担发错的后果
-- 幂等、限流、冷场判断集中在一处，好测
+一个什么消息都回「收到」的助手，比不说话的更烦人。`should_reply()` **默认返回 False**：
 
-### 幂等：同一条消息只起草一次
+- 纯确认语（收到 / 好的 / 嗯 / 👌）→ 不回
+- 纯附件（`[图片]` `[语音]`）→ 不回
+- 没有疑问或请求信号的陈述句 → 不回
 
-`outbox.source_message_id` 记录"这条草稿是为哪条收到的消息起的"。两道防线：
+只有出现问号、疑问词，或明确请求（"帮我 / 麻烦 / 发一下 / 确认"）才进入起草。
 
-1. `find_candidates()` 阶段过滤掉已有草稿的消息
-2. `enqueue_draft()` 再拦一次，理由写 `这条消息已起草过（message#N）`
+### 升级：唯一该惊动人的情况
+
+命中 `合同 / 金额 / 报价 / 付款 / 投诉 / 律师 / 急 / 领导说` 这类词时，agent **不做主张**，
+直接 `escalate()` 并附理由。这种事替人拍板，比不回更糟。
+
+### 幂等：同一条消息只处理一次
+
+`outbox.source_message_id` 记录来源消息。两道防线：`find_candidates()` 过滤 + `enqueue_draft()` 二次拦截。
 
 ### Composer 可插拔
 
@@ -278,24 +301,38 @@ def my_composer(ctx):
 drafter.run_once(store, my_composer)
 ```
 
-内置的 `template_composer` 只是**占位实现**，用来验证链路。它的回复质量不代表真实能力，别直接用。
+内置 `template_composer` 只是**占位实现**，用来验证链路，回复质量不代表真实能力。
 
 ### 一个必须知道的能力边界
 
-`related`（composer 拿到的相关历史）走的是**子串检索**：
-找得到「同一句话的重复出现」，**找不到「换个说法问同一件事」**。
-真实语义召回要靠 v1.2 的向量 / RRF 融合，不要在这里假装有。
+`related`（composer 拿到的相关历史）走**子串检索**：找得到「同一句话的重复出现」，
+**找不到「换个说法问同一件事」**。真实语义召回要靠 v1.2 的向量 / RRF 融合。
 
 ### 跑一遍
 
 ```bash
-python tools/draft_demo.py
+python tools/auto_loop_demo.py     # 自治回路：读 → 判断 → 回/沉默/升级 → 推送
 ```
 
-## 11. 草稿推送（接到手机）
+## 11. 动向推送（接到手机）
 
 > **本仓库不做手机端。** 手机端就是飞书 / Telegram / 邮件的 App 本身——
 > 我们只给机器人发一条消息，推送走它们自家的通道。
+
+常态是「✅ 刚替你回了 N 条」，看过就行；只有 agent 拿不准时才出现「🚨 需要你介入」：
+
+```
+🚨 需要你介入 1 条
+
+#1 [王五] 涉及「合同」，应由本人判断
+   收到：合同你签了吗
+
+──────────
+
+✅ 刚替你回了 1 条
+
+· [张三] 评审改到几点了？ → 收到，我确认一下再回你。
+```
 
 | 通道 | 手机端 | 需要什么 |
 |---|---|---|
@@ -303,48 +340,34 @@ python tools/draft_demo.py
 | Telegram Bot | Telegram App | @BotFather 拿 token |
 | SMTP | 系统邮件 | 邮箱账号 |
 
-### 零回调的确认闭环
+### 命令
 
 ```bash
 export IMEM_FEISHU_WEBHOOK='https://open.feishu.cn/open-apis/bot/v2/hook/xxx'
 
-python tools/push_drafts.py --db imem.db              # dry-run，只打印
-python tools/push_drafts.py --db imem.db --send       # 推到你手机
-python tools/push_drafts.py --db imem.db --approve 1 3  # 确认第 1、3 条
-python tools/push_drafts.py --db imem.db --cancel 2     # 作废第 2 条
+python tools/push_drafts.py --db imem.db            # dry-run，只打印
+python tools/push_drafts.py --db imem.db --send     # 推到你手机
+python tools/push_drafts.py --db imem.db --resolve 1  # 处理完第 1 条升级项
 ```
-
-手机上收到的是这样一条消息：
-
-```
-📝 待审草稿 3 条
-
-#1 [张三]
-   收到：评审改到几点了？
-   拟回：收到，我确认一下再回你。
-#2 [李四]
-   收到：合同你签了吗
-   拟回：收到，我确认一下再回你。
-```
-
-**每条都必须带「收到什么」**——只知道"我打算回什么"、不知道在回什么，人是没法做判断的。
 
 编号按 `outbox.id` 升序固定，避免每次顺序不同导致点错条目。
 
-### 确认 ≠ 发送
+`--approve` / `--cancel` 仍保留，用于 `auto_approve=False`（人工审稿模式）下的手写草稿。
 
-`--approve` 只把状态从 `draft` 改成 `approved`。真正的发送仍要在 UI 上执行并回读验证
-（见 §9）。**这个脚本永远不会替你发消息**——有测试守着这条红线。
+### 推送 ≠ 发送
 
-### 确认方式的三档演进
+推送只是告诉你情况。真正的发送由**执行器**在 UI 上做，然后回读验证（见 §9）。
+**这个脚本永远不会替你发消息**——有测试守着这条红线。
+
+### 人的介入方式的三档演进
 
 | 档 | 你要做什么 | 需要什么 | 状态 |
 |---|---|---|---|
-| **L0 单向推送 + 本机确认** | 手机上看到清单，回机器上执行 `--approve` | 一个 webhook URL | ✅ 已实现 |
-| L1 回复关键词 | 在飞书回 `ok 2`，机器人收到后 approve | 飞书长连接（不需要公网 IP） | ⬜ |
-| L2 卡片按钮 | 点消息里的「发送」「作废」 | 自建应用 + 卡片回调 | ⬜ |
+| **L0 单向推送** | 看「已替你回了」，偶尔处理「需要你介入」 | 一个 webhook URL | ✅ 已实现 |
+| L1 回复关键词 | 在飞书回 `ok 2` 处理升级项 | 飞书长连接（不需要公网 IP） | ⬜ |
+| L2 卡片按钮 | 点消息里的按钮 | 自建应用 + 卡片回调 | ⬜ |
 
-先做 L0 的原因：它零回调基础设施就能形成真闭环，而且能立刻暴露"草稿质量够不够"这个真问题。
+自治模式下，人的常态动作是**什么都不用做**——L1/L2 只是把偶尔的升级处理挪到手机上。
 
 ## 12. 尚未实现（按优先级）
 
@@ -369,8 +392,9 @@ IM-Agent-Memory/
 │   └── notifier.py       草稿推送：飞书 webhook / Telegram / SMTP
 ├── tools/
 │   ├── mock_demo.py      端到端演示：读 → 检索 → 起草 → 闸门 → 发送 → 回读
-│   ├── draft_demo.py     草稿模式演示：起草后停在 draft，绝不发送
-│   └── push_drafts.py    推送待审草稿到手机 + 本机确认/作废
+│   ├── draft_demo.py     人工审稿模式演示：停在 draft，绝不发送
+│   ├── auto_loop_demo.py 自治回路演示：读 → 判断 → 回/沉默/升级 → 推送
+│   └── push_drafts.py    推送动向到手机 + 处理升级项
 └── tests/
     ├── run_all.py        统一入口
     ├── test_imem.py      21 个：存储与检索
