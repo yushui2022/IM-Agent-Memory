@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 本地数据（不要提交真实聊天记录）
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+shots/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
