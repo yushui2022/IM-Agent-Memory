@@ -261,7 +261,7 @@ def _clamp(v: int, lo: int, hi: int) -> int:
 
 def find_selected_row(rgb: Sequence[int], width: int, height: int, *,
                       area: vision.Area | None = None,
-                      row_h: int = DEFAULT_ROW_H, row_top: int = 0,
+                      row_h: int = DEFAULT_ROW_H, row_top: int | None = None,
                       min_delta: float = 4.0) -> int | None:
     """找出当前打开的是第几行。
 
@@ -293,6 +293,11 @@ def find_selected_row(rgb: Sequence[int], width: int, height: int, *,
             f"像素数不足: 期望 {width * height * 3}，实际 {len(rgb)}")
 
     x0, y0, x1, y1 = _area_px(area or vision.DEFAULT_LAYOUT.chat_list, width, height)
+    # row_top 缺省就取列表顶边：这样"第 0 行"就是看得见的第一行。
+    # 之前缺省成 0，导致列表顶边在 y=64 时每一行都多算一位——
+    # 内部虽然自洽（点对位置了），但行号和人眼对不上，排查时非常误导。
+    if row_top is None:
+        row_top = y0
 
     means: dict[int, float] = {}
     # 从区域的顶边开始切条，行号仍按 row_top 计 —— 否则窗口下移一点，
@@ -327,3 +332,46 @@ def find_selected_row(rgb: Sequence[int], width: int, height: int, *,
     if len(ranked) > 1 and (best_delta - ranked[1][0]) < min_delta:
         return None
     return best_row
+
+
+def row_band(gray: Sequence[int], width: int, height: int, *,
+             area: vision.Area, row_y: int, row_h: int,
+             stride_x: int = 4, stride_y: int = 2) -> list[int]:
+    """取某一行「去掉整体明暗后」的结构指纹。
+
+    为什么不能直接比像素
+    --------------------
+    判断「列表被我点过之后，这个位置还是不是原来那个会话」，直接比像素是不行的：
+    点一下会让整行背景变亮（选中高亮），角标也会消失——这些都是**均匀变化**，
+    但它们和「列表重排了」混在一起，分不开。
+
+    减掉这一行自己的均值，均匀偏移就被抵消了，剩下的是文字和头像的形状。
+    换了会话，形状一定不同；只是被选中/角标消失，形状基本不变。
+
+    真实 X11 上就是这么暴露出来的：最早用整块区域指纹，结果每次切换后
+    指纹必变，`restore()` 永远判「列表动过」，恢复功能等于从未生效。
+    """
+    x0, y0, x1, y1 = _area_px(area, width, height)
+    top = max(y0, int(row_y))
+    bottom = min(y1, top + int(row_h))
+    if bottom <= top:
+        return []
+
+    vals: list[int] = []
+    for y in range(top, bottom, max(1, stride_y)):
+        base = y * width
+        for x in range(x0, x1, max(1, stride_x)):
+            vals.append(gray[base + x])
+    if not vals:
+        return []
+
+    mean = sum(vals) / len(vals)
+    return [int(v - mean) for v in vals]
+
+
+def bands_differ(a: Sequence[int], b: Sequence[int], *, tol: float = 6.0) -> bool:
+    """两段结构指纹是不是「不同的行」。平均绝对差超过 tol 就算变了。"""
+    if not a or not b or len(a) != len(b):
+        return True
+    diff = sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+    return diff > tol
