@@ -319,7 +319,8 @@ class Store:
     def enqueue_draft(self, conversation_key: str, text: str, *,
                       allow_group: bool = False, max_len: int = 500,
                       rate_limit: int = 3, rate_window_s: int = 60,
-                      dup_window_s: int = 600) -> dict:
+                      dup_window_s: int = 600,
+                      source_message_id: int | None = None) -> dict:
         """把待发消息放进队列。返回 {id, state, risk, reason}。
 
         闸门命中时 state='cancelled' + risk='blocked'，并写入 block_reason 留痕。
@@ -334,6 +335,8 @@ class Store:
         reason = None
         if not body:
             reason = "空内容"
+        elif source_message_id is not None and self.outbox_for_message(source_message_id):
+            reason = f"这条消息已起草过（message#{source_message_id}）"
         elif conv["kind"] == "group" and not allow_group:
             reason = "群聊默认禁止代发；确需放开请显式传 allow_group=True"
         elif len(body) > max_len:
@@ -357,10 +360,10 @@ class Store:
         with self._tx():
             cur = self.conn.execute(
                 "INSERT INTO outbox(conversation_key, text, text_norm, state, risk,"
-                " block_reason, created_at) VALUES (?,?,?,?,?,?,?)",
+                " block_reason, created_at, source_message_id) VALUES (?,?,?,?,?,?,?,?)",
                 (conversation_key, body, T.normalize(body),
                  "cancelled" if reason else "draft",
-                 "blocked" if reason else "normal", reason, now))
+                 "blocked" if reason else "normal", reason, now, source_message_id))
             oid = int(cur.lastrowid)
         return {"id": oid, "state": "cancelled" if reason else "draft",
                 "risk": "blocked" if reason else "normal", "reason": reason}
@@ -407,6 +410,13 @@ class Store:
 
     def outbox_get(self, outbox_id: int) -> dict | None:
         r = self.conn.execute("SELECT * FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+        return dict(r) if r else None
+
+    def outbox_for_message(self, message_id: int) -> dict | None:
+        """这条收到的消息是否已经起过草稿（幂等依据）。"""
+        r = self.conn.execute(
+            "SELECT * FROM outbox WHERE source_message_id=? ORDER BY id DESC LIMIT 1",
+            (message_id,)).fetchone()
         return dict(r) if r else None
 
     def outbox_pending(self, conversation_key: str | None = None) -> list[dict]:

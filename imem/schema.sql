@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     attempts         INTEGER NOT NULL DEFAULT 0,
     -- 回读验证命中的那条 message（自我验证闭环）
     message_id       INTEGER REFERENCES message(id),
+    -- 这条草稿是为哪条收到的消息起的（幂等：同一条只起草一次）
+    source_message_id INTEGER REFERENCES message(id),
     note             TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_conv_state ON outbox(conversation_key, state);

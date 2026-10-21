@@ -7,7 +7,7 @@ from pathlib import Path
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 # 每次改表结构就 +1，并在 _migrate() 里补上对应的 ALTER。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -42,6 +42,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE message ADD COLUMN sent_by TEXT NOT NULL DEFAULT 'unknown'")
     if "outbox_id" not in cols:
         conn.execute("ALTER TABLE message ADD COLUMN outbox_id INTEGER")
+
+    ocols = _columns(conn, "outbox")
+    if "source_message_id" not in ocols:
+        conn.execute("ALTER TABLE outbox ADD COLUMN source_message_id INTEGER")
 
     conn.execute(
         "INSERT INTO meta(k, v) VALUES('schema_version', ?)"

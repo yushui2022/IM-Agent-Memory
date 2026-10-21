@@ -238,7 +238,61 @@ s.set_self_label("wechat", "我的昵称")
 
 不登记的话所有消息都是 `unknown`，且回读验证无法工作。
 
-## 10. 尚未实现（按优先级）
+## 10. 起草层（草稿模式）
+
+`imem/drafter.py`：读到新消息 → 判断该不该回 → 起草 → `enqueue_draft()`。
+**状态停在 `draft`，全程不发送。**
+
+### 默认策略（`Policy`，偏保守）
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `max_age_s` | 3600 | 超过 1 小时的消息不再起草 |
+| `min_gap_s` | 30 | 同一会话两条草稿的最小间隔（`<=0` 表示不限） |
+| `skip_groups` | True | 群聊不起草（群发本来就被闸门拦） |
+| `only_unanswered` | True | 已经被本人/agent 回过的消息跳过 |
+| `max_drafts_per_run` | 5 | 单轮上限 |
+
+### 为什么单独一层
+
+- 选哪些消息值得回、什么时候回，是**策略**问题，不该散落在 agent 主循环里
+- 起草质量可以**单独评估**——你只看草稿，不承担发错的后果
+- 幂等、限流、冷场判断集中在一处，好测
+
+### 幂等：同一条消息只起草一次
+
+`outbox.source_message_id` 记录"这条草稿是为哪条收到的消息起的"。两道防线：
+
+1. `find_candidates()` 阶段过滤掉已有草稿的消息
+2. `enqueue_draft()` 再拦一次，理由写 `这条消息已起草过（message#N）`
+
+### Composer 可插拔
+
+```python
+from imem import drafter
+
+def my_composer(ctx):
+    # ctx = {conversation, message, recent, related}
+    return call_llm(build_prompt(ctx))     # 返回 None = 这条不值得回
+
+drafter.run_once(store, my_composer)
+```
+
+内置的 `template_composer` 只是**占位实现**，用来验证链路。它的回复质量不代表真实能力，别直接用。
+
+### 一个必须知道的能力边界
+
+`related`（composer 拿到的相关历史）走的是**子串检索**：
+找得到「同一句话的重复出现」，**找不到「换个说法问同一件事」**。
+真实语义召回要靠 v1.2 的向量 / RRF 融合，不要在这里假装有。
+
+### 跑一遍
+
+```bash
+python tools/draft_demo.py
+```
+
+## 11. 尚未实现（按优先级）
 
 1. `search()` 与 `vector_search()` 的结果融合（RRF）——现在两者独立
 2. 跨 app 同一实体的**候选建议**（`unresolved()` 已给出素材）
@@ -246,7 +300,7 @@ s.set_self_label("wechat", "我的昵称")
 4. 保留策略与遗忘（按会话 / 按人删除原始消息）
 5. 增量导出给 LLM 做摘要的批处理封装
 
-## 11. 目录
+## 12. 目录
 
 ```
 IM-Agent-Memory/
@@ -256,15 +310,18 @@ IM-Agent-Memory/
 │   ├── schema.sql        表结构（observation/conversation/entity/alias/message/outbox）
 │   ├── text.py           归一化 / CJK 分词 / 时间解析 / 去重锚
 │   ├── db.py             连接、初始化、幂等迁移
-│   └── store.py          唯一对外 API（读写 + 出站闸门）
+│   ├── store.py          唯一对外 API（读写 + 出站闸门）
+│   └── drafter.py        起草层：候选筛选 / 策略 / composer 插槽
 ├── tools/
-│   └── mock_demo.py      端到端演示：读 → 检索 → 起草 → 闸门 → 发送 → 回读
+│   ├── mock_demo.py      端到端演示：读 → 检索 → 起草 → 闸门 → 发送 → 回读
+│   └── draft_demo.py     草稿模式演示：起草后停在 draft，绝不发送
 └── tests/
     ├── run_all.py        统一入口
     ├── test_imem.py      21 个：存储与检索
-    └── test_outbox.py    14 个：出站闸门、归因、静默失败
+    ├── test_outbox.py    14 个：出站闸门、归因、静默失败
+    └── test_drafter.py   14 个：起草策略、幂等、绝不发送
 ```
 
-## 12. 许可证
+## 13. 许可证
 
 [MIT](LICENSE) © 2026 yushui2022
