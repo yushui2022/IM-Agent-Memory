@@ -48,6 +48,7 @@
 | **G10** | **起草层**：筛出该回的消息、起草、只入队（幂等、限流、冷场判断） | ✅ v1.0.2 |
 | **G11** | **草稿推送**：把待审草稿发到手机（复用飞书/Telegram/邮件），本机确认 | ✅ v1.0.3 |
 | **G12** | **默认自治**：自动回 / 沉默 / 升级人工三出口，人不在常态路径上 | ✅ v1.0.4 |
+| **G13** | **画面采集**：帧闸门只放行真变化、多模态抽取不信任模型、跨帧一致性升 verified | ✅ v1.0.5 |
 
 ---
 
@@ -202,6 +203,38 @@ v1.0.2 / v1.0.3 做的是"起草 → 人审 → 放行"。但需求是**代替�
 **边界不变**：自治 ≠ 自动发送。发送仍由执行器在 UI 上做并回读验证，
 本仓库只到 `approved` 为止。
 
+### v1.0.5 — 采集层（读屏幕）✅ 已完成
+
+**补的是整条链路里最大的那个缺口。** 前面四个版本做的都是「已经拿到消息之后」的事：
+存储、检索、起草、闸门、推送。可如果消息进不来，这些全是空转。
+
+**选型**：路线 A —— 截屏 + 多模态模型读取。
+
+不为别的：`C`（解密客户端本地库）确实实时且零遗漏，但它会让
+「agent 就是在用电脑的人」这个前提直接崩掉——而整个项目的安全论证都建在这个前提上。
+`B`（UIAutomation）在微信客户端上基本读不到正文。只剩 A。
+
+| 交付 | 说明 |
+|---|---|
+| `vision.Gate` | 格平均亮度差分 + 分区判断。**先免费判断画面变没变，再决定要不要花钱** |
+| `vision.Layout` | 界面分区（标题栏/消息区/会话列表/输入框）显式建模，换 IM 换一份 |
+| `extract.build_prompt()` | 铁律写死在 prompt：不许推算时间、不许润色、不许把界面元素当消息 |
+| `extract.parse_model_output()` | 解析宽松（剥 markdown、捞 JSON），校验严格（类型/长度/置信度） |
+| `extract.CallableExtractor` | 厂商无关：`fn(images, prompt) -> str`，不绑 SDK |
+| `extract.to_ingest_payload()` | 顺带解决"无时间戳 → 锚点漂移"：生成跨帧稳定的 `client_ref` |
+| `pipeline.commit()` | 新消息 insert + 跨帧证据 confirm，一步落地 |
+| `store.ingest()` 增强 | 跳过重复时回传 `stats['existing']`；新增 `confirm_many()` |
+| `tools/collect_demo.py` | 合成帧跑通全链路，不需要真微信也不需要真模型 |
+
+**验收**：新增 59 个测试（累计 131），其中 22 个守帧闸门（自己打字不能把自己刷醒）、
+37 个守抽取层（模型输出不听话时还站不站得住）。
+
+**踩到的真坑**：`pipeline` 最初只认 `stats['existing']`，于是**模型越听话，
+`confirmed` 永远是 0**——因为 prompt 明确要求它不要重复输出，它照做了，
+而"我又看到了一遍"这本身就是可靠性证据。现在两条路径都收。
+
+**没做**：会话切换调度（同一时刻只看得到一个会话）。
+
 ### v1.1 — 真实数据达标 ⏸ 暂缓（待真实数据）
 
 **目标**：把 S1/S6 从"未验证"变成"已验证"，并据实调整 schema 与阈值。
@@ -267,8 +300,8 @@ v1.0.2 / v1.0.3 做的是"起草 → 人审 → 放行"。但需求是**代替�
 git clone https://github.com/yushui2022/IM-Agent-Memory.git
 cd IM-Agent-Memory
 
-# 1) 行为测试（21 个）
-python tests/test_imem.py
+# 1) 全部行为测试（131 个）
+python tests/run_all.py
 
 # 2) 规模与延迟（v1.1 起提供）
 # python tools/bench.py
@@ -277,7 +310,10 @@ python tests/test_imem.py
 # python tools/eval_real_data.py --input my_chats.json
 ```
 
-零第三方依赖，只需 Python ≥ 3.9（用到 `X | None` 语法）与内置 SQLite（需含 FTS5）。
+核心（`imem` / `tests` / `tools/collect_demo.py`）零第三方依赖，只需 Python ≥ 3.9
+（用到 `X | None` 语法）与内置 SQLite（需含 FTS5）。
+`imem/vision.py` 与 `imem/extract.py` 同样只用标准库——视觉模型调用在外层适配器里，
+本仓库不绑任何厂商 SDK。
 
 ---
 

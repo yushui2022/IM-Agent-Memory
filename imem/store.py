@@ -153,12 +153,16 @@ class Store:
           1. m['new'] is True        → 强制插入，ordinal 取该锚的下一个空位
           2. m['client_ref'] 已存在   → 跳过（见 client_ref 说明）
           3. (anchor, ordinal) 已存在 → 跳过（滚动重看同一批时走这条）
-          4. 否则插入
+
+        被跳过的消息，它已有的 id 会进 stats['existing']。这是「跨帧一致性」的
+        证据来源：同一条内容被两次独立抽取读到，说明它确实稳定地摆在屏幕上，
+        调用者可以据此把这行从 observed 升到 confirmed。
         ordinal 在**同一批次内**按相同锚递增，所以"三条相同的『好的』"会存成三条。
         """
         cap_iso, cap_epoch, _ = T.parse_ts(captured_at)
         msgs = list(messages or [])
-        stats = {"inserted": 0, "skipped": 0, "messages": [], "warnings": []}
+        stats = {"inserted": 0, "skipped": 0, "messages": [], "existing": [],
+                 "warnings": []}
         batch_ordinal: dict[str, int] = {}
 
         with self._tx():
@@ -181,17 +185,22 @@ class Store:
                 ah = T.anchor_hash(conversation_key, sender, body, ts_epoch)
                 client_ref = (m.get("client_ref") or "").strip() or None
 
-                if client_ref and self._client_ref_exists(conversation_key, client_ref):
-                    stats["skipped"] += 1
-                    continue
+                if client_ref:
+                    prev_id = self._client_ref_id(conversation_key, client_ref)
+                    if prev_id:
+                        stats["skipped"] += 1
+                        stats["existing"].append(prev_id)
+                        continue
 
                 if m.get("new"):
                     ordinal = self._next_ordinal(conversation_key, ah)
                 else:
                     ordinal = batch_ordinal.get(ah, 0)
                     batch_ordinal[ah] = ordinal + 1
-                    if self._anchor_exists(conversation_key, ah, ordinal):
+                    prev_id = self._anchor_id(conversation_key, ah, ordinal)
+                    if prev_id:
                         stats["skipped"] += 1
+                        stats["existing"].append(prev_id)
                         continue
 
                 fts_bi, fts_uni = T.build_fts(body)
@@ -244,6 +253,32 @@ class Store:
         return self.conn.execute(
             "SELECT 1 FROM message WHERE conversation_key=? AND anchor_hash=? AND ordinal=?",
             (conv, ah, ordinal)).fetchone() is not None
+
+    def _client_ref_id(self, conv: str, ref: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT id FROM message WHERE conversation_key=? AND client_ref=?",
+            (conv, ref)).fetchone()
+        return int(row["id"]) if row else None
+
+    def _anchor_id(self, conv: str, ah: str, ordinal: int) -> int | None:
+        row = self.conn.execute(
+            "SELECT id FROM message WHERE conversation_key=? AND anchor_hash=? AND ordinal=?",
+            (conv, ah, ordinal)).fetchone()
+        return int(row["id"]) if row else None
+
+    def confirm_many(self, message_ids: Iterable[int]) -> int:
+        """把一批消息升到 confirmed。重复观测到的证据走这里。"""
+        ids = [int(i) for i in message_ids if i is not None]
+        if not ids:
+            return 0
+        marked = 0
+        with self._tx():
+            for mid in ids:
+                cur = self.conn.execute(
+                    "UPDATE message SET state='confirmed' WHERE id=? AND state='observed'",
+                    (mid,))
+                marked += cur.rowcount or 0
+        return marked
 
     def _next_ordinal(self, conv: str, ah: str) -> int:
         row = self.conn.execute(

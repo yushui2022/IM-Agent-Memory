@@ -1,12 +1,17 @@
 """IM-Agent-Memory：给 agent 用的 IM 存储与检索层。
 
 设计前提（重要）：
-  本层不负责"看屏幕"。感知由 agent 自己完成，它把
-  (昵称, 正文, 时间戳) 写进来。所以这里的一切都应假设输入**可能有错**：
+  感知不在本层。它只负责「把已经看到的东西记准、记全、可溯源」。
+  所以这里的一切都应假设输入**可能有错**：
     - sender 可能没消歧 → sender_entity_key 允许 NULL
     - ts 可能拿不到     → 退化为观测时刻并标 inferred
     - 同一条消息可能被写入多次 → anchor/client_ref 去重
     - 消息可能撤回       → state='vanished'
+
+  想连"看屏幕"一起要的话，用 vision/extract/pipeline 这三个模块：
+    vision.py   帧差分，判断这一帧值不值得送模型
+    extract.py  多模态抽取，把画面变成候选消息草稿
+    pipeline.py 草稿落地 + 跨帧 confirm
 
 快速开始：
     from imem import Store
@@ -21,7 +26,7 @@
         s.search("方案", scope=conv)
 """
 from .store import Store
-from . import text
+from . import extract, pipeline, text, vision
 
-__all__ = ["Store", "text"]
-__version__ = "1.0.0"
+__all__ = ["Store", "text", "vision", "extract", "pipeline"]
+__version__ = "1.0.5"
