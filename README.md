@@ -185,7 +185,9 @@ s.vector_search("会议怎么定的", scope=conv)
 ## 10. 目录
 
 ```
-im-agent-memory/
+IM-Agent-Memory/
+├── ROADMAP.md         目标、成功判据、版本规划
+├── LICENSE            MIT
 ├── imem/
 │   ├── schema.sql     表结构（4 张核心表 + FTS + 可选向量）
 │   ├── text.py        归一化 / CJK 分词 / 时间解析 / 去重锚
@@ -193,3 +195,7 @@ im-agent-memory/
 │   └── store.py       唯一对外 API
 └── tests/test_imem.py 21 个行为测试
 ```
+
+## 11. 许可证
+
+[MIT](LICENSE) © 2026 yushui2022
