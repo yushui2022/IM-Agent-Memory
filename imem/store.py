@@ -196,16 +196,34 @@ class Store:
 
                 fts_bi, fts_uni = T.build_fts(body)
                 entity_key = self._resolve_sender(conversation_key, sender)
+
+                # 回读验证：这条是不是我们自己刚发出去的？
+                # 必须先确认发送者是「我」，否则别人说同样的话会被误判成 agent 发的
+                is_self = self._is_self(conversation_key, sender)
+                ob = self._match_sent_outbox(conversation_key, body) if is_self else None
+                if ob:
+                    sent_by = "agent"
+                else:
+                    sent_by = m.get("sent_by")
+                    if sent_by not in ("other", "human", "agent", "unknown"):
+                        sent_by = "human" if is_self else "other"
+
                 cur = self.conn.execute(
                     "INSERT INTO message(conversation_key, sender_entity_key, sender_label,"
                     " sender_norm, text, ts_est, ts_epoch, ts_conf, msg_type, anchor_hash,"
                     " ordinal, client_ref, state, fts_bi, fts_uni, source_observation_id,"
-                    " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " sent_by, outbox_id, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (conversation_key, entity_key, sender, T.normalize(sender), body,
                      ts_iso, ts_epoch, ts_conf, m.get("msg_type") or "text", ah,
                      ordinal, client_ref, "observed", fts_bi, fts_uni,
-                     observation_id, T.now_iso()))
+                     observation_id, sent_by, ob["id"] if ob else None, T.now_iso()))
                 mid = int(cur.lastrowid)
+                if ob:
+                    self.conn.execute(
+                        "UPDATE outbox SET state='verified', message_id=?, verified_at=?"
+                        " WHERE id=?", (mid, T.now_iso(), ob["id"]))
+                    stats.setdefault("verified_outbox", []).append(ob["id"])
                 stats["inserted"] += 1
                 stats["messages"].append(mid)
 
@@ -249,6 +267,163 @@ class Store:
             cur = self.conn.execute(
                 "UPDATE message SET state='confirmed' WHERE id=?", (message_id,))
             return cur.rowcount or 0
+
+    # ============================================================== 出站（代发）
+    # 铁律：这里只**入队**，不发送。发送动作由 agent 在真实 UI 上执行，
+    #       执行完必须回读验证——而回读验证就是调用 ingest()。
+
+    @staticmethod
+    def _iso_ago(seconds: int) -> str:
+        from datetime import timedelta as _td
+        return (datetime.now(T.TZ) - _td(seconds=seconds)).isoformat(timespec="seconds")
+
+    def set_self_label(self, app: str, label: str) -> None:
+        """登记"我在这个 app 里显示成什么"。用于区分自己的消息和别人的。"""
+        with self._tx():
+            self.conn.execute(
+                "INSERT INTO meta(k, v) VALUES(?, ?)"
+                " ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (f"self_label:{app}", label))
+
+    def self_label(self, app: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT v FROM meta WHERE k=?", (f"self_label:{app}",)).fetchone()
+        return row["v"] if row else None
+
+    def _is_self(self, conversation_key: str, sender: str) -> bool:
+        row = self.conn.execute(
+            "SELECT app FROM conversation WHERE key=?", (conversation_key,)).fetchone()
+        if not row:
+            return False
+        label = self.self_label(row["app"])
+        return bool(label) and T.normalize(label) == T.normalize(sender)
+
+    def _match_sent_outbox(self, conversation_key: str, body: str,
+                           window_minutes: int = 15):
+        """回读时判断：这条消息是不是我们自己刚发出去的。"""
+        row = self.conn.execute(
+            "SELECT id, sent_at FROM outbox WHERE conversation_key=?"
+            " AND state='sent' AND text_norm=? AND sent_at IS NOT NULL"
+            " ORDER BY sent_at DESC LIMIT 1",
+            (conversation_key, T.normalize(body))).fetchone()
+        if not row:
+            return None
+        try:
+            sent_epoch = T.parse_ts(row["sent_at"])[1]
+        except (ValueError, TypeError):
+            return row
+        if abs(T.parse_ts(None)[1] - sent_epoch) > window_minutes * 60:
+            return None
+        return row
+
+    def enqueue_draft(self, conversation_key: str, text: str, *,
+                      allow_group: bool = False, max_len: int = 500,
+                      rate_limit: int = 3, rate_window_s: int = 60,
+                      dup_window_s: int = 600) -> dict:
+        """把待发消息放进队列。返回 {id, state, risk, reason}。
+
+        闸门命中时 state='cancelled' + risk='blocked'，并写入 block_reason 留痕。
+        """
+        body = (text or "").strip()
+        conv = self.conn.execute(
+            "SELECT key, kind, title FROM conversation WHERE key=?",
+            (conversation_key,)).fetchone()
+        if not conv:
+            raise KeyError(f"未知会话: {conversation_key}")
+
+        reason = None
+        if not body:
+            reason = "空内容"
+        elif conv["kind"] == "group" and not allow_group:
+            reason = "群聊默认禁止代发；确需放开请显式传 allow_group=True"
+        elif len(body) > max_len:
+            reason = f"超过 {max_len} 字上限（实际 {len(body)}）"
+        else:
+            n = self.conn.execute(
+                "SELECT COUNT(*) FROM outbox WHERE conversation_key=? AND created_at >= ?",
+                (conversation_key, self._iso_ago(rate_window_s))).fetchone()[0]
+            if n >= rate_limit:
+                reason = f"限流：{rate_window_s}s 内已入队 {n} 条"
+            else:
+                dup = self.conn.execute(
+                    "SELECT id FROM outbox WHERE conversation_key=? AND text_norm=?"
+                    " AND state IN ('draft','approved','sent') AND created_at >= ?",
+                    (conversation_key, T.normalize(body), self._iso_ago(dup_window_s))
+                ).fetchone()
+                if dup:
+                    reason = f"重复内容（已有 outbox#{dup['id']}），疑似循环"
+
+        now = T.now_iso()
+        with self._tx():
+            cur = self.conn.execute(
+                "INSERT INTO outbox(conversation_key, text, text_norm, state, risk,"
+                " block_reason, created_at) VALUES (?,?,?,?,?,?,?)",
+                (conversation_key, body, T.normalize(body),
+                 "cancelled" if reason else "draft",
+                 "blocked" if reason else "normal", reason, now))
+            oid = int(cur.lastrowid)
+        return {"id": oid, "state": "cancelled" if reason else "draft",
+                "risk": "blocked" if reason else "normal", "reason": reason}
+
+    def preflight(self, conversation_key: str, seen_title: str) -> dict:
+        """发送前的窗口校验：防止"切错窗口还照发"。"""
+        conv = self.conn.execute(
+            "SELECT title FROM conversation WHERE key=?", (conversation_key,)).fetchone()
+        if not conv:
+            return {"ok": False, "reason": f"未知会话 {conversation_key}", "expected": None}
+        ok = T.normalize(seen_title) == T.normalize(conv["title"])
+        return {"ok": ok, "expected": conv["title"], "seen": seen_title,
+                "reason": None if ok else "前台窗口标题与目标会话不一致，疑似切错窗口"}
+
+    def approve(self, outbox_id: int) -> int:
+        with self._tx():
+            cur = self.conn.execute(
+                "UPDATE outbox SET state='approved', approved_at=? WHERE id=? AND state='draft'",
+                (T.now_iso(), outbox_id))
+            return cur.rowcount or 0
+
+    def mark_sent(self, outbox_id: int) -> int:
+        """agent 在 UI 上按下发送后调用。此时**还没有证据**证明发出去了。"""
+        with self._tx():
+            cur = self.conn.execute(
+                "UPDATE outbox SET state='sent', sent_at=?, attempts=attempts+1"
+                " WHERE id=? AND state='approved'",
+                (T.now_iso(), outbox_id))
+            return cur.rowcount or 0
+
+    def fail(self, outbox_id: int, note: str = "") -> int:
+        with self._tx():
+            cur = self.conn.execute(
+                "UPDATE outbox SET state='failed', note=? WHERE id=?"
+                " AND state IN ('draft','approved','sent')", (note, outbox_id))
+            return cur.rowcount or 0
+
+    def cancel(self, outbox_id: int) -> int:
+        with self._tx():
+            cur = self.conn.execute(
+                "UPDATE outbox SET state='cancelled' WHERE id=?"
+                " AND state IN ('draft','approved')", (outbox_id,))
+            return cur.rowcount or 0
+
+    def outbox_get(self, outbox_id: int) -> dict | None:
+        r = self.conn.execute("SELECT * FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+        return dict(r) if r else None
+
+    def outbox_pending(self, conversation_key: str | None = None) -> list[dict]:
+        """还没发出去、或发了但没验证的条目 —— agent 每轮应该先看这个。"""
+        sql = ("SELECT * FROM outbox WHERE state IN ('draft','approved','sent')")
+        args: list[Any] = []
+        if conversation_key:
+            sql += " AND conversation_key=?"; args.append(conversation_key)
+        sql += " ORDER BY id"
+        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+
+    def outbox_unverified(self, older_than_s: int = 120) -> list[dict]:
+        """已发送但迟迟没回读验证 —— 大概率发送失败，需要重试或人工确认。"""
+        rows = self.conn.execute(
+            "SELECT * FROM outbox WHERE state='sent' AND sent_at <= ? ORDER BY sent_at",
+            (self._iso_ago(older_than_s),)).fetchall()
+        return [dict(r) for r in rows]
 
     # ============================================================== 读取
     def who(self, name: str, scope_key: str | None = None,
@@ -493,6 +668,8 @@ class Store:
             "type": r["msg_type"],
             "state": r["state"],
             "observation_id": r["source_observation_id"],
+            "sent_by": r["sent_by"] if "sent_by" in r.keys() else "unknown",
+            "outbox_id": r["outbox_id"] if "outbox_id" in r.keys() else None,
         }
         if score is not None:
             d["_score"] = round(score, 4)

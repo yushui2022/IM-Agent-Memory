@@ -174,7 +174,71 @@ s.vector_search("会议怎么定的", scope=conv)
 
 存储用 `float32` BLOB，检索是**暴力余弦**。到十万条以内都够用；再往上就该换 ANN 索引了（届时把 `vector_search` 换成外部实现即可，schema 不用动）。
 
-## 9. 尚未实现（按优先级）
+## 9. 出站（代发）能力
+
+> ⚠️ 这是本仓库**唯一会对外产生副作用**的部分。它让云工能"以你的身份"在微信里说话，
+> 所以默认全部关着，靠闸门逐层放开。
+
+### 状态机
+
+```
+draft ──approve()──► approved ──mark_sent()──► sent ──回读验证──► verified
+  │                    │                        │
+  └──cancel()──► cancelled ◄──cancel()          └──fail()──► failed
+```
+
+**关键点：`sent` 不等于"发出去了"。** computer use 按下发送键后，你无法从任何返回值知道结果——
+焦点错了、网络慢、被风控拦、消息被折叠，全都"看起来发了"。唯一的证据是**回读**。
+
+### 回读验证：`ingest()` 兼任验证器
+
+下一帧感知读到自己那条消息时，`ingest()` 会自动比对 `outbox` 里 `state='sent'` 的同内容条目：
+
+```python
+res = s.ingest(conv, [{"sender": "我", "text": "收到，晚点回你"}])
+res["verified_outbox"]        # [3]  → outbox#3 置为 verified
+```
+
+并把该 message 标记为 `sent_by='agent'` + `outbox_id=3`。
+**匹配前必须确认发送者是"我"**，否则别人说了同样的话会被误判成 agent 发的。
+
+### 四道闸门（命中即 `risk='blocked'`，并写入 `block_reason` 留痕）
+
+| 闸门 | 默认值 | 说明 |
+|---|---|---|
+| **群聊禁止代发** | 开 | 群里发错是公开事故。确需放开显式传 `allow_group=True` |
+| 超长 | 500 字 | 防止把一大段内容灌进输入框 |
+| 限流 | 60s / 3 条 | 防止 agent 卡在循环里刷屏 |
+| 重复内容 | 600s 内同文 | **死循环特征**：自己发的还没回读，又起草同一条 |
+
+### 发送前预检
+
+```python
+s.preflight(conv, seen_title="张三")   # {"ok": True, ...}
+s.preflight(conv, seen_title="产品群") # {"ok": False, "reason": "疑似切错窗口"}
+```
+
+UI 操作最常见的错误就是切错窗口还照发，所以发送前必须核对前台窗口标题。
+
+### agent 每轮该看的三样
+
+```python
+s.outbox_pending(conv)        # draft/approved/sent —— 我欠着哪些没发完
+s.outbox_unverified(120)      # sent 超 120 秒还没回读 = 大概率静默失败
+s.unresolved()                # 读不准的部分（见 §4）
+```
+
+### 归因字段 `sent_by`
+
+`other` / `human` / `agent` / `unknown`。需要先登记"我叫什么"：
+
+```python
+s.set_self_label("wechat", "我的昵称")
+```
+
+不登记的话所有消息都是 `unknown`，且回读验证无法工作。
+
+## 10. 尚未实现（按优先级）
 
 1. `search()` 与 `vector_search()` 的结果融合（RRF）——现在两者独立
 2. 跨 app 同一实体的**候选建议**（`unresolved()` 已给出素材）
@@ -182,20 +246,25 @@ s.vector_search("会议怎么定的", scope=conv)
 4. 保留策略与遗忘（按会话 / 按人删除原始消息）
 5. 增量导出给 LLM 做摘要的批处理封装
 
-## 10. 目录
+## 11. 目录
 
 ```
 IM-Agent-Memory/
-├── ROADMAP.md         目标、成功判据、版本规划
-├── LICENSE            MIT
+├── ROADMAP.md            目标、成功判据、版本规划
+├── LICENSE               MIT
 ├── imem/
-│   ├── schema.sql     表结构（4 张核心表 + FTS + 可选向量）
-│   ├── text.py        归一化 / CJK 分词 / 时间解析 / 去重锚
-│   ├── db.py          连接与初始化
-│   └── store.py       唯一对外 API
-└── tests/test_imem.py 21 个行为测试
+│   ├── schema.sql        表结构（observation/conversation/entity/alias/message/outbox）
+│   ├── text.py           归一化 / CJK 分词 / 时间解析 / 去重锚
+│   ├── db.py             连接、初始化、幂等迁移
+│   └── store.py          唯一对外 API（读写 + 出站闸门）
+├── tools/
+│   └── mock_demo.py      端到端演示：读 → 检索 → 起草 → 闸门 → 发送 → 回读
+└── tests/
+    ├── run_all.py        统一入口
+    ├── test_imem.py      21 个：存储与检索
+    └── test_outbox.py    14 个：出站闸门、归因、静默失败
 ```
 
-## 11. 许可证
+## 12. 许可证
 
 [MIT](LICENSE) © 2026 yushui2022

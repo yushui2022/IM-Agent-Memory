@@ -61,6 +61,32 @@ CREATE TABLE IF NOT EXISTS entity_alias (
 );
 CREATE INDEX IF NOT EXISTS ix_alias_entity ON entity_alias(entity_key);
 
+-- ---------------------------------------------------------------- 出站队列
+-- 「云工以用户身份发言」的安全闸门。没有这张表就不该有任何发送动作。
+CREATE TABLE IF NOT EXISTS outbox (
+    id               INTEGER PRIMARY KEY,
+    conversation_key TEXT    NOT NULL REFERENCES conversation(key) ON DELETE CASCADE,
+    text             TEXT    NOT NULL,
+    text_norm        TEXT    NOT NULL,
+    state            TEXT    NOT NULL DEFAULT 'draft'
+                             CHECK (state IN ('draft','approved','sent',
+                                              'verified','failed','cancelled')),
+    -- 闸门判定结果，留痕便于事后追责
+    risk             TEXT    NOT NULL DEFAULT 'normal'
+                             CHECK (risk IN ('normal','blocked')),
+    block_reason     TEXT,
+    created_at       TEXT    NOT NULL,
+    approved_at      TEXT,
+    sent_at          TEXT,
+    verified_at      TEXT,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    -- 回读验证命中的那条 message（自我验证闭环）
+    message_id       INTEGER REFERENCES message(id),
+    note             TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_outbox_conv_state ON outbox(conversation_key, state);
+CREATE INDEX IF NOT EXISTS ix_outbox_state ON outbox(state);
+
 -- ---------------------------------------------------------------- 消息
 CREATE TABLE IF NOT EXISTS message (
     id                    INTEGER PRIMARY KEY,
@@ -87,6 +113,11 @@ CREATE TABLE IF NOT EXISTS message (
     fts_bi                TEXT    NOT NULL DEFAULT '',
     fts_uni               TEXT    NOT NULL DEFAULT '',
     source_observation_id INTEGER REFERENCES observation(id),
+    -- 归因：这条是谁产生的。agent 一旦能发消息，这个字段是防死循环的前提
+    sent_by               TEXT    NOT NULL DEFAULT 'unknown'
+                                  CHECK (sent_by IN ('other','human','agent','unknown')),
+    -- 若该消息由 outbox 发出，指回队列项（回读验证时填入）
+    outbox_id             INTEGER REFERENCES outbox(id),
     created_at            TEXT    NOT NULL,
     UNIQUE (conversation_key, anchor_hash, ordinal)
 );
