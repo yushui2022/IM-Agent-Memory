@@ -242,3 +242,32 @@ def signature(grid: list[list[int]]) -> int:
             h ^= v
             h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     return h
+
+
+def region_signature(gray: Sequence[int], width: int, height: int, area: Area, *,
+                     stride: int = 4) -> int:
+    """只对一个区域取指纹。用来回答"这块界面动过没有"。
+
+    和 signature() 是同一个 FNV-1a，只是不经过网格——区域通常很窄
+    （比如会话列表），按 stride 抽样就够了，而且对整行背景色变化敏感得多。
+
+    典型用途：切会话之前记下会话列表的指纹，切完再比。指纹没变，
+    就说明行号没有错位，可以放心按旧坐标点回去。
+    """
+    if len(gray) < width * height:
+        raise ValueError(f"像素数不足: 期望 {width * height}，实际 {len(gray)}")
+    if stride <= 0:
+        raise ValueError("stride 必须为正")
+
+    x0 = max(0, min(width - 1, int(area[0] * width)))
+    x1 = max(x0 + 1, min(width, int(round(area[2] * width))))
+    y0 = max(0, min(height - 1, int(area[1] * height)))
+    y1 = max(y0 + 1, min(height, int(round(area[3] * height))))
+
+    h = 1469598103934665603
+    for y in range(y0, y1, stride):
+        base = y * width
+        for x in range(x0, x1, stride):
+            h ^= gray[base + x]
+            h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h

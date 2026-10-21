@@ -257,3 +257,73 @@ def _area_px(area: vision.Area, width: int, height: int) -> tuple[int, int, int,
 
 def _clamp(v: int, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
+
+
+def find_selected_row(rgb: Sequence[int], width: int, height: int, *,
+                      area: vision.Area | None = None,
+                      row_h: int = DEFAULT_ROW_H, row_top: int = 0,
+                      min_delta: float = 4.0) -> int | None:
+    """找出当前打开的是第几行。
+
+    为什么需要它
+    ------------
+    "切回去"要知道原来打开的那个会话在哪一行。界面上没有行号，但这行
+    有个别的行没有的特征：它被选中了，整行背景色和别的行不一样。
+    按 row_h 切条、逐行算平均亮度，偏离中位数最多的那条就是它。
+
+    为什么敢返回 None
+    -----------------
+    认错行的代价是点错一个会话——白白吃掉别人的未读。所以宁可不认：
+
+      - 偏离不够大（背景色差异小于 min_delta）
+      - 有两行偏离得差不多（分不清谁是选中行）
+
+    两种情况都返回 None，调用方就不该恢复。恢复是锦上添花，不是必需品，
+    没有它最多是屏幕停错了地方，用户自己点一下就好。
+
+    已知的脆弱点
+    ------------
+    带图片缩略图的会话行，平均亮度也会明显偏离。靠"只允许一个赢家"挡掉
+    一部分，但挡不干净。换主题、改深色模式、改字号，min_delta 都要重标。
+    """
+    if row_h <= 0:
+        raise ValueError("row_h 必须为正")
+    if len(rgb) < width * height * 3:
+        raise ValueError(
+            f"像素数不足: 期望 {width * height * 3}，实际 {len(rgb)}")
+
+    x0, y0, x1, y1 = _area_px(area or vision.DEFAULT_LAYOUT.chat_list, width, height)
+
+    means: dict[int, float] = {}
+    # 从区域的顶边开始切条，行号仍按 row_top 计 —— 否则窗口下移一点，
+    # 所有行号就整体偏一位，点回去会点错行
+    top = max(row_top, y0)
+    while top + row_h <= y1:
+        row = (top - row_top) // row_h
+        total = 0
+        n = 0
+        for y in range(top, top + row_h):
+            base = y * width * 3
+            for x in range(x0, x1):
+                i = base + x * 3
+                total += (rgb[i] + rgb[i + 1] + rgb[i + 2]) // 3
+                n += 1
+        if n:
+            means[row] = total / n
+        top += row_h
+
+    # 少于 4 行就没有可信的基线：中位数可能正好落在选中行自己身上，
+    # 于是"最亮的那一行"反而被当成选中行。真实会话列表几乎总是超过 4 行，
+    # 少于此数一律不认。
+    if len(means) < 4:
+        return None
+
+    baseline = sorted(means.values())[len(means) // 2]
+    ranked = sorted(((abs(m - baseline), r) for r, m in means.items()), reverse=True)
+
+    best_delta, best_row = ranked[0]
+    if best_delta < min_delta:
+        return None
+    if len(ranked) > 1 and (best_delta - ranked[1][0]) < min_delta:
+        return None
+    return best_row

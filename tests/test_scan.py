@@ -234,3 +234,69 @@ def test_row_titles_clear():
     t.learn(0, "产品群")
     t.clear()
     assert len(t) == 0
+
+
+# ------------------------------------------------------------------ 选中行
+LIST = (0.04, 0.0, 0.24, 1.0)      # 让 5 个完整行落进来
+RH = 40                            # 200 / 40 = 5 行
+LX0, LX1 = int(0.04 * W), int(round(0.24 * W))
+
+
+def _list_frame(selected: int | None = None, value: int = 232,
+                extra: dict[int, int] | None = None) -> bytearray:
+    """造一个 5 行的会话列表。
+
+    先铺背景色、再统一撒"文字"噪声——顺序很重要：如果先撒噪声再铺背景，
+    选中行就连文字一起被抹平了，差异会被人为放大，测出来的阈值是假的。
+    """
+    b = blank()
+    if selected is not None:
+        paint(b, LX0, selected * RH, LX1, (selected + 1) * RH, (value, value, value))
+    for r, v in (extra or {}).items():
+        paint(b, LX0, r * RH, LX1, (r + 1) * RH, (v, v, v))
+    for y in range(0, H, 3):
+        paint(b, LX0 + 4, y, LX0 + 16, y + 1, (90, 90, 90))
+    return b
+
+
+def selected(buf, **kw):
+    return scan.find_selected_row(buf, W, H, area=LIST, row_h=RH, **kw)
+
+
+def test_selected_row_none_when_uniform():
+    assert selected(_list_frame()) is None
+
+
+def test_selected_row_finds_each_position():
+    for r in range(5):
+        assert selected(_list_frame(r)) == r, r
+
+
+def test_selected_row_respects_threshold():
+    """背景只差 3，低于默认 min_delta=4 —— 不认。"""
+    assert selected(_list_frame(1, value=247)) is None
+
+
+def test_selected_row_refuses_when_two_candidates_tie():
+    """两行背景都在变，分不清谁被选中 —— 不猜。"""
+    assert selected(_list_frame(1, extra={2: 233})) is None
+
+
+def test_selected_row_needs_enough_rows():
+    """少于 4 行时中位数不可信，宁可返回 None。"""
+    assert scan.find_selected_row(_list_frame(1), W, H, area=LIST, row_h=100) is None
+
+
+def test_selected_row_rejects_bad_input():
+    try:
+        scan.find_selected_row(_list_frame(1), W, H, area=LIST, row_h=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("row_h=0 应当抛 ValueError")
+
+    try:
+        scan.find_selected_row(bytearray(10), W, H, area=LIST, row_h=RH)
+    except ValueError:
+        return
+    raise AssertionError("像素数不足时应当抛 ValueError")

@@ -240,3 +240,56 @@ def test_signature_is_stable_and_discriminating():
     b = grid(b_frame)
     assert vision.signature(a) == vision.signature(grid(frame()))
     assert vision.signature(a) != vision.signature(b)
+
+
+# ------------------------------------------------------------------ 区域指纹
+def gray_frame(value: int = 240) -> bytes:
+    return bytes([value]) * (W * H)
+
+
+def paint_gray(buf: bytearray, x0: int, y0: int, x1: int, y1: int, v: int) -> None:
+    for y in range(y0, y1):
+        base = y * W
+        for x in range(x0, x1):
+            buf[base + x] = v
+
+
+def test_region_signature_is_stable():
+    g = gray_frame()
+    assert (vision.region_signature(g, W, H, vision.DEFAULT_LAYOUT.chat_list)
+            == vision.region_signature(g, W, H, vision.DEFAULT_LAYOUT.chat_list))
+
+
+def test_region_signature_changes_inside_area():
+    g = bytearray(gray_frame())
+    area = vision.DEFAULT_LAYOUT.chat_list
+    before = vision.region_signature(bytes(g), W, H, area)
+    paint_gray(g, int(area[0] * W) + 5, int(area[1] * H) + 5,
+               int(area[0] * W) + 25, int(area[1] * H) + 25, 20)
+    assert vision.region_signature(bytes(g), W, H, area) != before
+
+
+def test_region_signature_ignores_outside_area():
+    """消息区变了不该影响会话列表的指纹——这正是它的用途。"""
+    g = bytearray(gray_frame())
+    area = vision.DEFAULT_LAYOUT.chat_list
+    before = vision.region_signature(bytes(g), W, H, area)
+    paint_gray(g, 200, 100, 300, 160, 20)          # 全在消息区
+    assert vision.region_signature(bytes(g), W, H, area) == before
+
+
+def test_region_signature_rejects_short_buffer():
+    try:
+        vision.region_signature(b"\x00" * 10, W, H, vision.DEFAULT_LAYOUT.chat_list)
+    except ValueError:
+        return
+    raise AssertionError("像素数不足时应当抛 ValueError")
+
+
+def test_region_signature_rejects_bad_stride():
+    try:
+        vision.region_signature(gray_frame(), W, H,
+                                vision.DEFAULT_LAYOUT.chat_list, stride=0)
+    except ValueError:
+        return
+    raise AssertionError("stride=0 应当抛 ValueError")
