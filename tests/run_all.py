@@ -10,7 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 MODULES = ["test_imem", "test_outbox", "test_drafter", "test_notifier",
-           "test_vision", "test_extract"]
+           "test_vision", "test_extract", "test_scan", "test_plan"]
 
 
 def load(name: str):

@@ -32,12 +32,31 @@ def repeated_ids(result: extract.ExtractResult) -> list[int]:
 
 
 def commit(store, conversation_key: str, result: extract.ExtractResult, *,
-           captured_at=None, observation_id: int | None = None) -> dict:
-    """一次观测的完整落地。返回 ingest 的统计，另外多两个字段：
+           captured_at=None, observation_id: int | None = None,
+           expect_conversation: str | None = None) -> dict:
+    """一次观测的完整落地。返回 ingest 的统计，另外多这些字段：
 
         confirmed  —— 本轮被升级为 confirmed 的条数
         payload    —— 本轮真正送去入库的草稿数
+        rejected   —— 仅当身份核对失败时出现，此时**什么都没写**
+
+    身份核对（切会话模式必须用）
+    ----------------------------
+    传了 `expect_conversation` 就进入严格模式：模型从标题栏读回的会话名
+    必须和预期一致，否则整批丢弃。
+
+    这不是洁癖。切会话是"点某个坐标"，点歪一格就会把 A 群的消息记成 B 群——
+    而且**没有任何自动手段能事后发现**：消息内容本身看起来完全正常，
+    只是归属错了。归属错了的记忆比没有记忆更坏，因为它会被当成事实引用。
+    所以这里默认从严：读不出来，就当没读到。
     """
+    if expect_conversation is not None:
+        got = result.conversation
+        if not got:
+            return _reject("conversation_unknown", expect_conversation, None)
+        if not extract.same_conversation(got, expect_conversation):
+            return _reject("conversation_mismatch", expect_conversation, got)
+
     payload = extract.to_ingest_payload(result, conversation_key=conversation_key)
     stats = store.ingest(conversation_key, payload,
                          observation_id=observation_id, captured_at=captured_at)
@@ -47,3 +66,19 @@ def commit(store, conversation_key: str, result: extract.ExtractResult, *,
     stats["confirmed"] = store.confirm_many(evidence)
     stats["payload"] = len(payload)
     return stats
+
+
+def _reject(reason: str, expected: str | None, got: str | None) -> dict:
+    """身份核对失败的返回。形状和 ingest 的 stats 保持一致，调用者不用分支。"""
+    return {
+        "inserted": 0,
+        "skipped": 0,
+        "messages": [],
+        "existing": [],
+        "warnings": [f"{reason}: 期望「{expected}」，读到「{got}」"],
+        "confirmed": 0,
+        "payload": 0,
+        "rejected": reason,
+        "expected_conversation": expected,
+        "got_conversation": got,
+    }

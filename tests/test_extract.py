@@ -370,3 +370,86 @@ def test_repeated_ids_collects_all():
         {"message_id": 4, "sender": "b", "text": "y"},
     ])
     assert pipeline.repeated_ids(res) == [3, 4]
+
+
+# ------------------------------------------------------------------ 会话身份
+def test_parse_reads_conversation():
+    r = extract.parse_model_output(json.dumps(
+        {"conversation": "产品群", "messages": []}, ensure_ascii=False))
+    assert r.conversation == "产品群"
+
+
+def test_parse_nullish_conversation_becomes_none():
+    for bad in ("", "null", "未知", "-"):
+        r = extract.parse_model_output(json.dumps(
+            {"conversation": bad, "messages": []}, ensure_ascii=False))
+        assert r.conversation is None, bad
+
+
+def test_parse_without_conversation_is_none():
+    assert extract.parse_model_output(payload(one())).conversation is None
+
+
+def test_same_conversation_normalizes_whitespace():
+    assert extract.same_conversation("产品 群", "产品群")
+    assert extract.same_conversation(" 产品群 ", "产品群")
+
+
+def test_same_conversation_is_deliberately_strict():
+    """宁可判成不同：判错会把 A 群的消息记进 B 群，且事后无法发现。"""
+    assert not extract.same_conversation("产品群", "产品群2")
+    assert not extract.same_conversation(None, "产品群")
+    assert not extract.same_conversation("", "")
+
+
+def test_prompt_asks_model_to_read_the_header():
+    p = extract.build_prompt(req(window_title=""))
+    assert "conversation" in p
+    assert "标题栏" in p
+
+
+# ------------------------------------------------------------------ 身份护栏
+GUARDED = json.dumps({"conversation": "产品群",
+                      "messages": [one(text="方案明天再看")]}, ensure_ascii=False)
+
+
+def test_commit_rejects_on_conversation_mismatch():
+    s = Store(":memory:")
+    conv = s.ensure_conversation("wechat", "产品群", kind="group")
+    r = extract.parse_model_output(GUARDED)
+
+    st = pipeline.commit(s, conv, r, expect_conversation="另一个群")
+    assert st["rejected"] == "conversation_mismatch", st
+    assert st["inserted"] == 0
+    assert s.stats()["messages"] == 0, "核对失败时一条都不许写"
+
+
+def test_commit_rejects_when_conversation_unreadable():
+    s = Store(":memory:")
+    conv = s.ensure_conversation("wechat", "产品群", kind="group")
+    r = extract.parse_model_output(payload(one(text="方案明天再看")))
+
+    st = pipeline.commit(s, conv, r, expect_conversation="产品群")
+    assert st["rejected"] == "conversation_unknown", st
+    assert s.stats()["messages"] == 0
+
+
+def test_commit_accepts_matching_conversation():
+    s = Store(":memory:")
+    conv = s.ensure_conversation("wechat", "产品群", kind="group")
+    r = extract.parse_model_output(GUARDED)
+
+    st = pipeline.commit(s, conv, r, expect_conversation="产品群")
+    assert "rejected" not in st
+    assert st["inserted"] == 1
+    assert s.stats()["messages"] == 1
+
+
+def test_commit_without_guard_stays_permissive():
+    """单会话模式（不切屏）不该被要求报会话名。"""
+    s = Store(":memory:")
+    conv = s.ensure_conversation("wechat", "产品群", kind="group")
+    r = extract.parse_model_output(payload(one(text="方案明天再看")))
+    st = pipeline.commit(s, conv, r)
+    assert st["inserted"] == 1
+

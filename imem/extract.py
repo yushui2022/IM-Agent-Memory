@@ -70,6 +70,7 @@ class ExtractResult:
     notes: str = ""
     confidence: float = 0.0
     warnings: list[str] = field(default_factory=list)
+    conversation: str | None = None
     raw: str = ""
 
     def __bool__(self) -> bool:
@@ -100,6 +101,7 @@ _SYSTEM_RULES = """你是一个屏幕读取器。你看到的是一组按时间�
 _JSON_SCHEMA = """只输出一个 JSON 对象，不要有任何额外文字、不要用 markdown 代码块：
 
 {
+  "conversation": "聊天区顶部标题栏显示的会话名，看不清就 null",
   "messages": [
     {
       "sender": "界面上显示的昵称",
@@ -114,12 +116,16 @@ _JSON_SCHEMA = """只输出一个 JSON 对象，不要有任何额外文字、�
 
 confidence 是你对这条"昵称+正文"都读对的把握，0 到 1 的小数。
 图片/表情/文件这类没有文字的，text 写一句客观描述，msg_type 标对，confidence 调低。
+
+conversation 只从**标题栏**读，不要根据消息内容或联系人去猜。它是切会话之后
+核对身份的唯一依据——读错比读不到更糟，所以看不清就老实填 null。
 """
 
 
 def build_prompt(req: ExtractRequest) -> str:
     """拼 prompt。把上一轮已入库的消息一起给它，让它只输出新增部分。"""
-    parts = [_SYSTEM_RULES, f"应用：{req.app}　　窗口标题：{req.window_title}"]
+    title = req.window_title or "（未知，请从标题栏读出来）"
+    parts = [_SYSTEM_RULES, f"应用：{req.app}　　窗口标题：{title}"]
 
     if req.previous:
         known = "\n".join(
@@ -160,9 +166,11 @@ def parse_model_output(raw: str, req: ExtractRequest | None = None) -> ExtractRe
     if isinstance(payload, list):
         items: Any = payload
         notes = ""
+        conv: Any = None
     elif isinstance(payload, dict):
         items = payload.get("messages") or payload.get("msgs") or payload.get("data") or []
         notes = str(payload.get("notes") or "").strip()
+        conv = payload.get("conversation") or payload.get("chat") or payload.get("title")
     else:
         raise ExtractError(f"JSON 顶层必须是对象或数组，实际是 {type(payload).__name__}")
 
@@ -170,6 +178,7 @@ def parse_model_output(raw: str, req: ExtractRequest | None = None) -> ExtractRe
         raise ExtractError(f"messages 必须是数组，实际是 {type(items).__name__}")
 
     res.notes = notes
+    res.conversation = _clean_str(conv) or None
 
     confs: list[float] = []
     for i, item in enumerate(items):
@@ -387,3 +396,14 @@ def stable_client_ref(conversation_key: str, sender: str, text: str) -> str:
     """跨帧稳定的去重键。同一会话 + 同一人 + 同一句正文 → 同一个值。"""
     raw = f"{conversation_key}|{_norm(sender)}|{_norm(text)}"
     return "scr:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def same_conversation(a: str | None, b: str | None) -> bool:
+    """两个会话名是不是同一个。
+
+    归一只压空白和大小写，不做同义词/别名消歧，而且**宁可判成不同**：
+    判错的代价是把一个群的记录写进另一个群（不可逆），
+    判严了只是多一次废读（可重来）。两边不对称，就按严的那边取。
+    """
+    na, nb = _norm(a), _norm(b)
+    return bool(na) and na == nb
